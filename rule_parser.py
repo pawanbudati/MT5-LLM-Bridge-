@@ -8,6 +8,7 @@ class RuleSignalParser:
     """
     Fast rule-based regex signal parser.
     Acts as a high-speed parser and fallback when the LLM is busy or unreachable.
+    Supports single signals, multi-clause breakout setups (BUY_STOP & SELL_STOP), and pending orders.
     """
 
     KNOWN_SYMBOLS = [
@@ -18,11 +19,62 @@ class RuleSignalParser:
     ]
 
     @classmethod
-    def parse(cls, text: str) -> TradeSignal:
+    def parse_multi(cls, text: str) -> List[TradeSignal]:
+        """
+        Parse one or more trading signals from a message.
+        Handles dual breakout setups (e.g. 'BUY GOLD ABOVE 2650 ... / SELL GOLD BELOW 2630 ...').
+        """
         raw = text.strip()
         cleaned = re.sub(r'[*_`#]', '', raw).upper()
 
-        # 1. Check for non-trading noise and scrap messages
+        if is_scrap_message(text) or len(cleaned) < 5:
+            return [TradeSignal(action=SignalAction.NONE, symbol="XAUUSD", raw_message=text, parser_used="rule")]
+
+        # Determine primary symbol from whole text to inherit in sub-clauses if needed
+        primary_symbol = None
+        for sym in cls.KNOWN_SYMBOLS:
+            if re.search(r'\b' + re.escape(sym) + r'\b', cleaned):
+                primary_symbol = sym
+                break
+
+        has_buy = bool(re.search(r'\bBUY\b', cleaned))
+        has_sell = bool(re.search(r'\bSELL\b', cleaned))
+
+        # If both BUY and SELL are present, attempt multi-clause split
+        if has_buy and has_sell:
+            parts = re.split(r'[\r\n]+|\s+/\s+|\s+OR\s+|\s+AND\s+|;\s*', raw, flags=re.IGNORECASE)
+            valid_parts = [p.strip() for p in parts if re.search(r'\b(?:BUY|SELL)\b', p.upper())]
+            if len(valid_parts) < 2:
+                # Try continuous split at second action
+                b_idx = cleaned.find("BUY")
+                s_idx = cleaned.find("SELL")
+                split_pos = max(b_idx, s_idx)
+                if split_pos > 0:
+                    valid_parts = [raw[:split_pos].strip(), raw[split_pos:].strip()]
+
+            signals: List[TradeSignal] = []
+            for p in valid_parts:
+                sig = cls.parse_single(p, inherited_symbol=primary_symbol)
+                if sig.action != SignalAction.NONE:
+                    signals.append(sig)
+
+            if len(signals) >= 2:
+                return signals
+
+        # Single signal parse
+        return [cls.parse_single(raw, inherited_symbol=primary_symbol)]
+
+    @classmethod
+    def parse(cls, text: str) -> TradeSignal:
+        """Parse text into a single TradeSignal (returns the first signal if multiple are found)."""
+        signals = cls.parse_multi(text)
+        return signals[0] if signals else TradeSignal(action=SignalAction.NONE, symbol="XAUUSD", raw_message=text, parser_used="rule")
+
+    @classmethod
+    def parse_single(cls, text: str, inherited_symbol: Optional[str] = None) -> TradeSignal:
+        raw = text.strip()
+        cleaned = re.sub(r'[*_`#]', '', raw).upper()
+
         if is_scrap_message(text) or len(cleaned) < 5:
             return TradeSignal(action=SignalAction.NONE, symbol="XAUUSD", raw_message=text, parser_used="rule")
 
@@ -32,6 +84,9 @@ class RuleSignalParser:
             if re.search(r'\b' + re.escape(sym) + r'\b', cleaned):
                 symbol = sym
                 break
+
+        if not symbol:
+            symbol = inherited_symbol
 
         if settings.FORCE_GOLD_ONLY and not symbol:
             symbol = "XAUUSD"
@@ -66,7 +121,16 @@ class RuleSignalParser:
         target_1 = extracted_targets[0] if len(extracted_targets) > 0 else None
         target_2 = extracted_targets[1] if len(extracted_targets) > 1 else None
 
-        sl_update_match = re.search(r'(?:UPDATE|MODIFY|MOVE|CHANGE|NEW|SET)?\s*(?:SL|STOP|STOPLOSS)\s*[-:=@]?\s*([0-9]+(?:\.[0-9]+)?)', cleaned)
+        # Robust SL extraction avoiding collision with BUY STOP / SELL STOP
+        sl_update_match = re.search(
+            r'(?:UPDATE|MODIFY|MOVE|CHANGE|NEW|SET)?\s*(?<!BUY\s)(?<!SELL\s)\b(?:SL|STOP\s*LOSS|STOPLOSS|S/L)\b\s*[-:=@]?\s*([0-9]+(?:\.[0-9]+)?)',
+            cleaned
+        )
+        if not sl_update_match:
+            sl_update_match = re.search(
+                r'(?<!BUY\s)(?<!SELL\s)\bSTOP\b\s*[-:=@]?\s*([0-9]+(?:\.[0-9]+)?)',
+                cleaned
+            )
         extracted_sl = float(sl_update_match.group(1)) if sl_update_match else None
 
         if not any(k in cleaned for k in ["BUY", "SELL"]):
@@ -102,7 +166,7 @@ class RuleSignalParser:
                     parser_used="rule"
                 )
 
-        # Pending order checks
+        # Pending order & Market order checks
         if "BUY LIMIT" in cleaned:
             action = SignalAction.BUY_LIMIT
         elif "SELL LIMIT" in cleaned:
@@ -112,19 +176,69 @@ class RuleSignalParser:
         elif "SELL STOP" in cleaned:
             action = SignalAction.SELL_STOP
         elif re.search(r'\bBUY\b', cleaned):
-            action = SignalAction.BUY
+            if re.search(r'\b(?:ABOVE|BREAKS?\s+ABOVE|BREAKOUT\s+ABOVE|BREAKS?|BREAKOUT)\b', cleaned):
+                action = SignalAction.BUY_STOP
+            elif re.search(r'\bBELOW\b', cleaned):
+                action = SignalAction.BUY_LIMIT
+            else:
+                action = SignalAction.BUY
         elif re.search(r'\bSELL\b', cleaned):
-            action = SignalAction.SELL
+            if re.search(r'\b(?:BELOW|BREAKS?\s+BELOW|BREAKDOWN\s+BELOW|BREAKS?|BREAKDOWN)\b', cleaned):
+                action = SignalAction.SELL_STOP
+            elif re.search(r'\bABOVE\b', cleaned):
+                action = SignalAction.SELL_LIMIT
+            else:
+                action = SignalAction.SELL
         else:
             return TradeSignal(action=SignalAction.NONE, symbol=symbol or "XAUUSD", raw_message=text, parser_used="rule")
 
         # 4. Extract Entry Price
         entry = None
-        entry_match = re.search(r'(?:BUY|SELL|ENTRY|NOW|PRICE|@|AT)\s*[-:=@]?\s*([0-9]+(?:\.[0-9]+)?)', cleaned)
-        if entry_match:
-            val = float(entry_match.group(1))
-            if extracted_sl is None or abs(val - extracted_sl) > 0.01:
-                entry = val
+
+        # 4a. Conditional triggers: ABOVE, BELOW, BREAKOUT, IF BREAKS
+        cond_match = re.search(
+            r'\b(?:ABOVE|BREAKS?\s+ABOVE|BREAKOUT\s+ABOVE|BELOW|BREAKS?\s+BELOW|BREAKDOWN\s+BELOW|IF\s+BREAKS?)\s*[-:=@]?\s*([0-9]+(?:\.[0-9]+)?)',
+            cleaned
+        )
+        if cond_match:
+            entry = float(cond_match.group(1))
+
+        # 4b. Explicit order types: BUY STOP, SELL STOP, BUY LIMIT, SELL LIMIT
+        if entry is None:
+            order_type_match = re.search(
+                r'\b(?:BUY\s+STOP|SELL\s+STOP|BUY\s+LIMIT|SELL\s+LIMIT)\s*[-:=@]?\s*([0-9]+(?:\.[0-9]+)?)',
+                cleaned
+            )
+            if order_type_match:
+                entry = float(order_type_match.group(1))
+
+        # 4c. Explicit keywords: ENTRY, PRICE, LEVEL, TRIGGER, @, AT, NOW
+        if entry is None:
+            entry_kw_match = re.search(
+                r'\b(?:ENTRY|PRICE|ENTRY\s+PRICE|EP|LEVEL|TRIGGER|NOW|@|AT)\s*[-:=@]?\s*([0-9]+(?:\.[0-9]+)?)',
+                cleaned
+            )
+            if entry_kw_match:
+                val = float(entry_kw_match.group(1))
+                if extracted_sl is None or abs(val - extracted_sl) > 0.01:
+                    entry = val
+
+        # 4d. Action + optional symbol + optional NOW + price (e.g. 'BUY GOLD 2650', 'SELL BTC 95200')
+        if entry is None and symbol:
+            sym_pattern = re.escape(symbol) + r'\s+'
+            m_sym = re.search(r'\b(?:BUY|SELL)\s+(?:' + sym_pattern + r')?(?:NOW\s+)?[-:=@]?\s*([0-9]+(?:\.[0-9]+)?)', cleaned)
+            if m_sym:
+                val = float(m_sym.group(1))
+                if extracted_sl is None or abs(val - extracted_sl) > 0.01:
+                    entry = val
+
+        # 4e. Direct BUY/SELL + price fallback
+        if entry is None:
+            entry_match = re.search(r'\b(?:BUY|SELL)\s*[-:=@]?\s*([0-9]+(?:\.[0-9]+)?)', cleaned)
+            if entry_match:
+                val = float(entry_match.group(1))
+                if extracted_sl is None or abs(val - extracted_sl) > 0.01:
+                    entry = val
 
         return TradeSignal(
             action=action,

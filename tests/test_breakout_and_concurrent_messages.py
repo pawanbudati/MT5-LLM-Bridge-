@@ -272,6 +272,50 @@ class TestBreakoutAndConcurrentMessages(unittest.TestCase):
 
         self.assertEqual(len(monitor.active_setups), 0, "Pending breakout must be cancelled by cancel_setup_for_symbol")
 
+    def test_worker_handles_dual_breakout_text_signals(self):
+        """Verify that _handle_text_task executes both BUY_STOP and SELL_STOP for dual breakout message."""
+        pair_cfg = PairConfig(
+            id=1,
+            name="Pair1",
+            channel="-1001111111",
+            mt5_path="C:\\mock\\terminal64.exe",
+            mode=PairMode.TEXT,
+            magic_number=111111,
+            dry_run=True
+        )
+        task_q = Queue()
+        stop_event = asyncio.Event()
+        worker = PairWorker(pair_cfg, task_q, stop_event)
+        worker.bridge = MagicMock()
+        worker.bridge.resolve_symbol.return_value = "GOLD.i#"
+        worker.bridge.execute_signal.return_value = ExecutionResult(success=True, action="PENDING", comment="OK")
+
+        task = TaskMessage(
+            task_type=TaskType.TEXT_TASK,
+            pair_id=1,
+            channel_id="-1001111111",
+            message_id=99,
+            text="BUY GOLD ABOVE 2650 SL 2640 TP 2680 / SELL GOLD BELOW 2630 SL 2640 TP 2600"
+        )
+
+        self.loop.run_until_complete(worker._handle_text_task(task))
+
+        # Check that execute_signal was called twice
+        self.assertEqual(worker.bridge.execute_signal.call_count, 2)
+        call_signals = [call.args[0] for call in worker.bridge.execute_signal.call_args_list]
+
+        # First signal: BUY_STOP @ 2650
+        self.assertEqual(call_signals[0].action, SignalAction.BUY_STOP)
+        self.assertEqual(call_signals[0].entry_price, 2650.0)
+        self.assertEqual(call_signals[0].stop_loss, 2640.0)
+        self.assertEqual(call_signals[0].take_profit, 2680.0)
+
+        # Second signal: SELL_STOP @ 2630
+        self.assertEqual(call_signals[1].action, SignalAction.SELL_STOP)
+        self.assertEqual(call_signals[1].entry_price, 2630.0)
+        self.assertEqual(call_signals[1].stop_loss, 2640.0)
+        self.assertEqual(call_signals[1].take_profit, 2600.0)
+
 
 if __name__ == "__main__":
     unittest.main()

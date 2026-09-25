@@ -568,6 +568,99 @@ class MT5Bridge:
         sl = round(signal.stop_loss, digits) if signal.stop_loss is not None else 0.0
         tp = round(signal.take_profit or (signal.target_1 or 0.0), digits) if (signal.take_profit or signal.target_1) else 0.0
 
+        point = symbol_info.point or 0.0001
+
+        # Check if the market has already reached or crossed the pending price trigger
+        if signal.action == SignalAction.BUY_STOP and tick.ask >= entry:
+            diff_pts = (tick.ask - entry) / point
+            if diff_pts <= settings.MAX_SLIPPAGE_POINTS:
+                logger.info(
+                    f"BUY_STOP level {entry} already breached by current ask {tick.ask} "
+                    f"({diff_pts:.1f} pts <= max {settings.MAX_SLIPPAGE_POINTS}). Executing immediate Market BUY."
+                )
+                return self.execute_market_trade(
+                    symbol=symbol,
+                    action=SignalAction.BUY,
+                    sl=signal.stop_loss,
+                    tp=signal.take_profit or signal.target_1,
+                    lot=signal.lot,
+                    comment=f"Breakout BUY [{signal.symbol or symbol}]",
+                    instrument=signal.symbol or symbol
+                )
+            else:
+                logger.warning(
+                    f"BUY_STOP level {entry} already exceeded by current ask {tick.ask} "
+                    f"({diff_pts:.1f} pts > max {settings.MAX_SLIPPAGE_POINTS}). Skipping stale signal."
+                )
+                return ExecutionResult(
+                    success=False,
+                    action=signal.action.value,
+                    symbol=symbol,
+                    comment=f"Breakout level {entry} already crossed by {diff_pts:.1f} points (> max slippage)"
+                )
+
+        elif signal.action == SignalAction.SELL_STOP and tick.bid <= entry:
+            diff_pts = (entry - tick.bid) / point
+            if diff_pts <= settings.MAX_SLIPPAGE_POINTS:
+                logger.info(
+                    f"SELL_STOP level {entry} already breached by current bid {tick.bid} "
+                    f"({diff_pts:.1f} pts <= max {settings.MAX_SLIPPAGE_POINTS}). Executing immediate Market SELL."
+                )
+                return self.execute_market_trade(
+                    symbol=symbol,
+                    action=SignalAction.SELL,
+                    sl=signal.stop_loss,
+                    tp=signal.take_profit or signal.target_1,
+                    lot=signal.lot,
+                    comment=f"Breakdown SELL [{signal.symbol or symbol}]",
+                    instrument=signal.symbol or symbol
+                )
+            else:
+                logger.warning(
+                    f"SELL_STOP level {entry} already exceeded by current bid {tick.bid} "
+                    f"({diff_pts:.1f} pts > max {settings.MAX_SLIPPAGE_POINTS}). Skipping stale signal."
+                )
+                return ExecutionResult(
+                    success=False,
+                    action=signal.action.value,
+                    symbol=symbol,
+                    comment=f"Breakdown level {entry} already crossed by {diff_pts:.1f} points (> max slippage)"
+                )
+
+        elif signal.action == SignalAction.BUY_LIMIT and tick.ask <= entry:
+            diff_pts = (entry - tick.ask) / point
+            if diff_pts <= settings.MAX_SLIPPAGE_POINTS:
+                logger.info(
+                    f"BUY_LIMIT level {entry} already reached by current ask {tick.ask}. "
+                    f"Executing immediate Market BUY."
+                )
+                return self.execute_market_trade(
+                    symbol=symbol,
+                    action=SignalAction.BUY,
+                    sl=signal.stop_loss,
+                    tp=signal.take_profit or signal.target_1,
+                    lot=signal.lot,
+                    comment=f"Limit BUY [{signal.symbol or symbol}]",
+                    instrument=signal.symbol or symbol
+                )
+
+        elif signal.action == SignalAction.SELL_LIMIT and tick.bid >= entry:
+            diff_pts = (tick.bid - entry) / point
+            if diff_pts <= settings.MAX_SLIPPAGE_POINTS:
+                logger.info(
+                    f"SELL_LIMIT level {entry} already reached by current bid {tick.bid}. "
+                    f"Executing immediate Market SELL."
+                )
+                return self.execute_market_trade(
+                    symbol=symbol,
+                    action=SignalAction.SELL,
+                    sl=signal.stop_loss,
+                    tp=signal.take_profit or signal.target_1,
+                    lot=signal.lot,
+                    comment=f"Limit SELL [{signal.symbol or symbol}]",
+                    instrument=signal.symbol or symbol
+                )
+
         if self.dry_run:
             logger.info(
                 f"[DRY RUN] Would place pending order: {signal.action.value} {lot} lots of {symbol} @ {entry} | "

@@ -229,27 +229,34 @@ class PairWorker:
         if task.reply_to_text:
             logger.info(f"Reply Context:\n{task.reply_to_text}")
 
-        signal = await asyncio.to_thread(self.llm.parse_message, task.text or "", task.reply_to_text)
-        logger.info(
-            f"Extracted Signal: Action={signal.action.value} | Symbol={signal.symbol} | "
-            f"Entry={signal.entry_price} | SL={signal.stop_loss} | TP={signal.take_profit} | "
-            f"T1={signal.target_1} | T2={signal.target_2} | Parser={signal.parser_used}"
-        )
+        if not self.llm:
+            self.llm = LLMSignalEngine()
 
-        if signal.action == SignalAction.NONE:
+        signals: List[TradeSignal] = await asyncio.to_thread(self.llm.parse_messages, task.text or "", task.reply_to_text)
+        valid_signals = [s for s in signals if s.action != SignalAction.NONE]
+
+        if not valid_signals:
             logger.info("Message evaluated as non-actionable. No trade taken.")
+            logger.info("=" * 60)
             return
 
-        if signal.symbol:
-            broker_sym = self.bridge.resolve_symbol(signal.symbol)
-            if broker_sym and self.breakout_monitor:
-                self.breakout_monitor.cancel_setup_for_symbol(broker_sym, instrument=signal.symbol, reason="SUPERSEDED_BY_TEXT_SIGNAL")
+        for signal in valid_signals:
+            logger.info(
+                f"Processing Signal: Action={signal.action.value} | Symbol={signal.symbol} | "
+                f"Entry={signal.entry_price} | SL={signal.stop_loss} | TP={signal.take_profit} | "
+                f"T1={signal.target_1} | T2={signal.target_2} | Parser={signal.parser_used}"
+            )
 
-        result = self.bridge.execute_signal(signal)
-        if result.success:
-            logger.info(Fore.GREEN + Style.BRIGHT + f"[SUCCESS] {result.action} on {result.symbol}: {result.comment}" + Style.RESET_ALL)
-        else:
-            logger.error(Fore.RED + Style.BRIGHT + f"[FAILED] {result.action} on {result.symbol}: {result.comment}" + Style.RESET_ALL)
+            if signal.symbol:
+                broker_sym = self.bridge.resolve_symbol(signal.symbol)
+                if broker_sym and self.breakout_monitor:
+                    self.breakout_monitor.cancel_setup_for_symbol(broker_sym, instrument=signal.symbol, reason="SUPERSEDED_BY_TEXT_SIGNAL")
+
+            result = self.bridge.execute_signal(signal)
+            if result.success:
+                logger.info(Fore.GREEN + Style.BRIGHT + f"[SUCCESS] {result.action} on {result.symbol}: {result.comment}" + Style.RESET_ALL)
+            else:
+                logger.error(Fore.RED + Style.BRIGHT + f"[FAILED] {result.action} on {result.symbol}: {result.comment}" + Style.RESET_ALL)
         logger.info("=" * 60)
 
     def _print_analysis_report(self, a: GeminiChartAnalysis):

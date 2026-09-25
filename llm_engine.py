@@ -1,7 +1,7 @@
 import re
 import json
 import logging
-from typing import Optional
+from typing import Optional, List
 from config import settings
 from models import TradeSignal, SignalAction
 from rule_parser import RuleSignalParser
@@ -15,9 +15,12 @@ If an explicit symbol is provided in the message (e.g., GOLD, XAUUSD, BTC, BTCUS
 If no symbol is mentioned in the message, default "symbol": "XAUUSD".
 
 Allowed "action" values:
-- "BUY" (market buy)
-- "SELL" (market sell)
-- "BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP" (pending orders)
+- "BUY" (immediate market buy)
+- "SELL" (immediate market sell)
+- "BUY_STOP" (buy breakout pending order, e.g. "BUY ABOVE <price>", "BUY IF BREAKS ABOVE <price>", "BUY STOP <price>")
+- "SELL_STOP" (sell breakdown pending order, e.g. "SELL BELOW <price>", "SELL IF BREAKS BELOW <price>", "SELL STOP <price>")
+- "BUY_LIMIT" (buy limit pending order, e.g. "BUY BELOW <price>", "BUY LIMIT <price>")
+- "SELL_LIMIT" (sell limit pending order, e.g. "SELL ABOVE <price>", "SELL LIMIT <price>")
 - "UPDATE_TARGETS_AND_SL" (set targets and stop loss, e.g. "TGT1- 4245 TGT2- 4235 SL- 4260")
 - "UPDATE_SL" (change or update stop loss, e.g. "SL 4260", "Update SL 4260")
 - "UPDATE_TP" (change or update take profit, e.g. "TP 4240", "Target 4240")
@@ -25,6 +28,13 @@ Allowed "action" values:
 - "CLOSE_PARTIAL" (close half, 50%, partial position)
 - "EXIT" (close all, exit trade now)
 - "NONE" (casual chat, greeting, non-actionable message)
+
+PENDING ORDER RULES:
+- "BUY ABOVE <price>" or "BUY IF BREAKS ABOVE <price>" or "BUY STOP <price>": Action MUST be "BUY_STOP", with "entry": <price>. Do NOT output "BUY" (market order)!
+- "SELL BELOW <price>" or "SELL IF BREAKS BELOW <price>" or "SELL STOP <price>": Action MUST be "SELL_STOP", with "entry": <price>. Do NOT output "SELL" (market order)!
+- "BUY BELOW <price>" or "BUY LIMIT <price>": Action MUST be "BUY_LIMIT", with "entry": <price>.
+- "SELL ABOVE <price>" or "SELL LIMIT <price>": Action MUST be "SELL_LIMIT", with "entry": <price>.
+- NEVER execute market order ("BUY" or "SELL") when a conditional breakout/stop level ("ABOVE", "BELOW", "IF BREAKS", "STOP", "LIMIT") is stated!
 
 RULES FOR TARGETS AND SL:
 - When a message lists targets (TGT1, TGT2, TGT3, TP1, TP2) and/or SL:
@@ -35,7 +45,7 @@ RULES FOR TARGETS AND SL:
 
 JSON Schema:
 {
-  "action": "BUY" | "SELL" | "UPDATE_TARGETS_AND_SL" | "UPDATE_SL" | "UPDATE_TP" | "BREAKEVEN" | "CLOSE_PARTIAL" | "EXIT" | "NONE",
+  "action": "BUY" | "SELL" | "BUY_STOP" | "SELL_STOP" | "BUY_LIMIT" | "SELL_LIMIT" | "UPDATE_TARGETS_AND_SL" | "UPDATE_SL" | "UPDATE_TP" | "BREAKEVEN" | "CLOSE_PARTIAL" | "EXIT" | "NONE",
   "symbol": "XAUUSD" | "BTCUSD" | "USOIL" | "US30" | "EURUSD" | string,
   "entry": float or null,
   "sl": float or null,
@@ -69,6 +79,27 @@ class LLMSignalEngine:
         if self.client is None:
             self._init_client()
         return self.client
+
+    def parse_messages(self, message_text: str, reply_to_text: Optional[str] = None) -> List[TradeSignal]:
+        """
+        Parse a Telegram message into one or more TradeSignals.
+        Supports dual breakout messages (e.g. BUY_STOP above X and SELL_STOP below Y).
+        """
+        if not message_text or not message_text.strip():
+            return [TradeSignal(action=SignalAction.NONE, raw_message=message_text, parser_used="none")]
+
+        if is_scrap_message(message_text):
+            logger.info(f"Ignored non-signal/scrap message: '{message_text.strip()[:60]}'")
+            return [TradeSignal(action=SignalAction.NONE, symbol="XAUUSD", raw_message=message_text, parser_used="filter")]
+
+        # Check if the message contains multi-order setups (e.g. dual breakout)
+        rule_multi = RuleSignalParser.parse_multi(message_text)
+        if len(rule_multi) >= 2:
+            logger.info(f"Detected multi-order signal setup ({len(rule_multi)} orders): {[s.action.value for s in rule_multi]}")
+            return rule_multi
+
+        # Single signal: delegate to parse_message
+        return [self.parse_message(message_text, reply_to_text)]
 
     def parse_message(self, message_text: str, reply_to_text: Optional[str] = None) -> TradeSignal:
         """
@@ -154,6 +185,19 @@ class LLMSignalEngine:
             if any(w in text_upper for w in ["CLOSE ALL", "EXIT ALL", "EXIT NOW", "CLOSE THIS TRADE", "EXIT THIS TRADE"]):
                 action = SignalAction.EXIT
 
+            # Post-processing heuristics to handle conditional pending orders accurately
+            if action == SignalAction.BUY:
+                if re.search(r'\b(?:ABOVE|BREAKS?\s+ABOVE|BREAKOUT\s+ABOVE|BREAKS?|BREAKOUT|BUY\s+STOP)\b', text_upper):
+                    action = SignalAction.BUY_STOP
+                elif re.search(r'\b(?:BELOW|BUY\s+LIMIT)\b', text_upper):
+                    action = SignalAction.BUY_LIMIT
+
+            elif action == SignalAction.SELL:
+                if re.search(r'\b(?:BELOW|BREAKS?\s+BELOW|BREAKDOWN\s+BELOW|BREAKS?|BREAKDOWN|SELL\s+STOP)\b', text_upper):
+                    action = SignalAction.SELL_STOP
+                elif re.search(r'\b(?:ABOVE|SELL\s+LIMIT)\b', text_upper):
+                    action = SignalAction.SELL_LIMIT
+
             # If entry was missed by LLM on order signals, extract from text
             if entry is None and action in (
                 SignalAction.BUY, SignalAction.SELL,
@@ -165,7 +209,7 @@ class LLMSignalEngine:
                     entry = rule_res.entry_price
 
             # Guard against hallucinating SL or TP when not in the message
-            has_sl_keyword = any(k in text_upper for k in ["SL", "STOP", "STOPLOSS", "S/L"])
+            has_sl_keyword = any(k in text_upper for k in ["SL", "STOPLOSS", "STOP LOSS", "S/L"]) or bool(re.search(r'(?<!BUY\s)(?<!SELL\s)\bSTOP\b', text_upper))
             if not has_sl_keyword:
                 sl = None
             elif entry is not None and sl is not None and abs(sl - entry) < 1e-6:
@@ -183,7 +227,10 @@ class LLMSignalEngine:
             target_1 = extracted_targets[0] if len(extracted_targets) > 0 else (float(parsed["target_1"]) if parsed.get("target_1") else None)
             target_2 = extracted_targets[1] if len(extracted_targets) > 1 else (float(parsed["target_2"]) if parsed.get("target_2") else None)
 
-            sl_match = re.search(r'(?:SL|STOP|STOPLOSS|S/L)\s*[-:=@]?\s*([0-9]+(?:\.[0-9]+)?)', text_upper)
+            sl_match = re.search(
+                r'(?:UPDATE|MODIFY|MOVE|CHANGE|NEW|SET)?\s*(?<!BUY\s)(?<!SELL\s)\b(?:SL|STOP\s*LOSS|STOPLOSS|S/L)\b\s*[-:=@]?\s*([0-9]+(?:\.[0-9]+)?)',
+                text_upper
+            )
             if sl_match and sl is None:
                 sl = float(sl_match.group(1))
 
