@@ -165,6 +165,7 @@ class PairConfig(BaseModel):
     lot_us30: Optional[float] = None
     lot_forex: Optional[float] = None
     lot_default: Optional[float] = None
+    past_hours: float = 0.0
 
 class TaskType(str, Enum):
     IMAGE_TASK = "image"

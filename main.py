@@ -41,10 +41,12 @@ def print_banner(pairs: List[PairConfig]):
     print(Fore.CYAN + Style.BRIGHT + "  Configured Channel <-> MT5 Terminal Pairs:" + Style.RESET_ALL)
     for p in pairs:
         mode_color = Fore.MAGENTA if p.mode == PairMode.IMAGE else (Fore.BLUE if p.mode == PairMode.TEXT else Fore.YELLOW)
+        past_str = f"{p.past_hours:g}h" if p.past_hours > 0 else "OFF"
         print(
-            f"   [{p.id}] {Fore.WHITE}{Style.BRIGHT}{p.name:20}{Style.RESET_ALL} | "
+            f"   [{p.id}] {Fore.WHITE}{Style.BRIGHT}{p.name:18}{Style.RESET_ALL} | "
             f"Mode: {mode_color}{p.mode.value.upper():5}{Style.RESET_ALL} | "
             f"Channel: {Fore.YELLOW}{p.channel:16}{Style.RESET_ALL} | "
+            f"Past: {Fore.CYAN}{past_str:4}{Style.RESET_ALL} | "
             f"Magic: {p.magic_number:7} | "
             f"MT5: {Path(p.mt5_path).parent.name if p.mt5_path else 'N/A'}"
         )

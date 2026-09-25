@@ -1,10 +1,12 @@
 import os
 import time
+import datetime
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Set
 from telethon import TelegramClient, events, utils as telethon_utils
+from telethon.tl import types as telethon_types
 from colorama import Fore, Style
 
 from config import settings
@@ -20,9 +22,13 @@ class MasterTelegramDispatcher:
         # Mapping from various channel identifiers (normalized int ID, string ID) -> List[PairConfig]
         self.channel_pairs_map: Dict[str, List[PairConfig]] = {}
         self.subscribed_entities = []
+        # Mapping pair_id -> resolved Telethon entity
+        self.pair_entities: Dict[int, Any] = {}
+        # Track dispatched message IDs per pair to avoid duplicate processing
+        self.dispatched_msg_ids: Dict[int, Set[int]] = {p.id: set() for p in self.pairs}
 
     async def start(self):
-        """Authenticate with Telegram, resolve all target channels, and register event handler."""
+        """Authenticate with Telegram, resolve all target channels, fetch past messages if configured, and register live event handler."""
         if not settings.TELEGRAM_API_ID or not settings.TELEGRAM_API_HASH:
             raise ValueError(
                 "TELEGRAM_API_ID or TELEGRAM_API_HASH is not set in .env! "
@@ -44,7 +50,10 @@ class MasterTelegramDispatcher:
             logger.warning("No channels were successfully resolved! Bot will not receive channel signals.")
             return
 
-        # Register unified new message event handler
+        # 1. Fetch and process past messages for configured pairs before starting live listening
+        await self._fetch_and_process_past_messages()
+
+        # 2. Register unified live new message event handler
         @self.client.on(events.NewMessage(chats=self.subscribed_entities))
         async def on_new_message(event):
             await self._handle_incoming_event(event)
@@ -52,7 +61,8 @@ class MasterTelegramDispatcher:
         logger.info(Fore.GREEN + Style.BRIGHT + "\n" + "=" * 70)
         logger.info(f" [*] MASTER TELEGRAM LISTENER ACTIVE - LISTENING TO {len(self.subscribed_entities)} CHANNELS")
         for p in self.pairs:
-            logger.info(f"     Pair #{p.id} [{p.name}]: Channel '{p.channel}' -> Mode: {p.mode.value.upper()}")
+            past_info = f"Past Messages: {p.past_hours:g}h" if p.past_hours > 0 else "Past Messages: Disabled"
+            logger.info(f"     Pair #{p.id} [{p.name}]: Channel '{p.channel}' -> Mode: {p.mode.value.upper()} | {past_info}")
         logger.info("=" * 70 + "\n" + Style.RESET_ALL)
 
     async def run_until_disconnected(self):
@@ -99,6 +109,9 @@ class MasterTelegramDispatcher:
                         break
 
             if entity:
+                # Store entity for pair
+                self.pair_entities[pair.id] = entity
+
                 # Add to subscribed entities for Telethon filter
                 if entity not in self.subscribed_entities:
                     self.subscribed_entities.append(entity)
@@ -131,8 +144,74 @@ class MasterTelegramDispatcher:
             else:
                 logger.error(Fore.RED + f"[-] Could not resolve channel '{target}' for Pair #{pair.id} [{pair.name}]!" + Style.RESET_ALL)
 
+    async def _fetch_and_process_past_messages(self):
+        """
+        For each configured pair where past_hours > 0, retrieve past messages
+        from its channel in chronological order and dispatch to its worker queue.
+        """
+        pairs_with_past = [p for p in self.pairs if getattr(p, "past_hours", 0) and p.past_hours > 0]
+        if not pairs_with_past:
+            logger.info("Past messages retrieval: Disabled (all pairs configured with 0 or blank past_hours).")
+            return
+
+        logger.info(Fore.CYAN + Style.BRIGHT + "\n" + "=" * 70)
+        logger.info(" [*] RETRIEVING PAST MESSAGES FOR CONFIGURED PAIRS ON STARTUP")
+        logger.info("=" * 70 + Style.RESET_ALL)
+
+        for pair in pairs_with_past:
+            entity = self.pair_entities.get(pair.id)
+            if not entity:
+                logger.warning(f"[-] Cannot retrieve past messages for Pair #{pair.id} [{pair.name}]: Channel '{pair.channel}' was not resolved.")
+                continue
+
+            past_hours = pair.past_hours
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            cutoff_time = now_utc - datetime.timedelta(hours=past_hours)
+
+            logger.info(
+                f"[*] Pair #{pair.id} [{pair.name}]: Fetching messages from past {past_hours:g} hour(s) "
+                f"(Since: {cutoff_time.strftime('%Y-%m-%d %H:%M:%S UTC')})..."
+            )
+
+            past_messages = []
+            try:
+                async for msg in self.client.iter_messages(entity, limit=1000):
+                    if isinstance(msg, telethon_types.MessageService):
+                        continue
+
+                    msg_date = getattr(msg, "date", None)
+                    if msg_date:
+                        if msg_date.tzinfo is None:
+                            msg_date = msg_date.replace(tzinfo=datetime.timezone.utc)
+                        if msg_date < cutoff_time:
+                            break
+                    past_messages.append(msg)
+            except Exception as e:
+                logger.error(f"Error retrieving past messages for Pair #{pair.id} [{pair.name}]: {e}", exc_info=True)
+                continue
+
+            if not past_messages:
+                logger.info(f"    No messages found in the last {past_hours:g} hour(s) for Pair #{pair.id} [{pair.name}].")
+                continue
+
+            # iter_messages yields newest to oldest. Reverse to process chronologically (oldest -> newest).
+            past_messages.reverse()
+            logger.info(
+                Fore.GREEN +
+                f"[+] Pair #{pair.id} [{pair.name}]: Retrieved {len(past_messages)} past messages "
+                f"(Msg #{past_messages[0].id} to #{past_messages[-1].id}). Dispatching in chronological order..." +
+                Style.RESET_ALL
+            )
+
+            for msg in past_messages:
+                await self._dispatch_message(msg, matching_pairs=[pair], is_past=True)
+
+            logger.info(Fore.GREEN + f"[+] Pair #{pair.id} [{pair.name}]: All {len(past_messages)} past messages dispatched to queue.\n" + Style.RESET_ALL)
+
+        logger.info(Fore.CYAN + " [*] Finished retrieving past messages. Transitioning to live listening...\n" + Style.RESET_ALL)
+
     async def _handle_incoming_event(self, event):
-        """Route incoming message to subscribed pair queues."""
+        """Route incoming live message to subscribed pair queues."""
         message = event.message
         chat_id = event.chat_id
         str_chat_id = str(chat_id)
@@ -150,49 +229,109 @@ class MasterTelegramDispatcher:
             logger.debug(f"Received message from non-mapped chat {chat_id}. Ignoring.")
             return
 
-        has_photo = bool(message.photo)
+        await self._dispatch_message(message, matching_pairs=matching_pairs, chat_id=chat_id, is_past=False)
+
+    async def _dispatch_message(
+        self,
+        message: Any,
+        matching_pairs: List[PairConfig],
+        chat_id: Optional[Any] = None,
+        is_past: bool = False
+    ):
+        """Extract media/text from a message and dispatch TaskMessage to matching pair queues."""
+        if chat_id is None:
+            chat_id = getattr(message, 'chat_id', None)
+            if chat_id is None and hasattr(message, 'peer_id'):
+                try:
+                    chat_id = telethon_utils.get_peer_id(message.peer_id)
+                except Exception:
+                    chat_id = None
+        str_chat_id = str(chat_id or "")
+
+        # Filter out pairs that have already dispatched this message ID
+        eligible_pairs: List[PairConfig] = []
+        for p in matching_pairs:
+            pair_dispatched = self.dispatched_msg_ids.setdefault(p.id, set())
+            if message.id in pair_dispatched:
+                logger.debug(f"Message #{message.id} already processed for Pair #{p.id} [{p.name}]. Skipping duplicate.")
+            else:
+                eligible_pairs.append(p)
+
+        if not eligible_pairs:
+            return
+
+        has_photo = bool(getattr(message, "photo", None))
         has_image_doc = bool(
-            message.document and 
+            getattr(message, "document", None) and 
             message.document.mime_type and 
             message.document.mime_type.startswith("image/")
         )
         is_image_msg = has_photo or has_image_doc
-        text_content = message.message or ""
+        text_content = getattr(message, "message", "") or ""
 
-        # Download image once if any matching pair requires an image
+        # Download image once if any eligible pair requires an image
         downloaded_image_path = None
-        needs_image = any(p.mode in (PairMode.IMAGE, PairMode.BOTH) for p in matching_pairs)
+        needs_image = any(p.mode in (PairMode.IMAGE, PairMode.BOTH) for p in eligible_pairs)
         if is_image_msg and needs_image:
             file_ext = ".jpg"
             if has_image_doc and message.document.mime_type:
                 ext = message.document.mime_type.split("/")[-1]
                 if ext in ("png", "jpeg", "webp"):
                     file_ext = f".{ext}"
-            save_path = settings.DOWNLOADS_DIR / f"chart_msg_{message.id}_{int(time.time())}{file_ext}"
-            try:
-                logger.info(f"Downloading image media from chat {chat_id} (Msg #{message.id})...")
-                downloaded = await message.download_media(file=str(save_path))
-                if downloaded:
-                    downloaded_image_path = str(save_path)
-            except Exception as e:
-                logger.error(f"Error downloading image media: {e}")
+
+            # Check if file already exists in downloads
+            existing_files = list(settings.DOWNLOADS_DIR.glob(f"chart_msg_{message.id}_*{file_ext}"))
+            if existing_files and existing_files[0].exists() and existing_files[0].stat().st_size > 0:
+                downloaded_image_path = str(existing_files[0])
+            else:
+                save_path = settings.DOWNLOADS_DIR / f"chart_msg_{message.id}_{int(time.time())}{file_ext}"
+                try:
+                    tag = "[PAST]" if is_past else "[LIVE]"
+                    logger.info(f"{tag} Downloading image media from chat {chat_id} (Msg #{message.id})...")
+                    downloaded = await message.download_media(file=str(save_path))
+                    if downloaded:
+                        downloaded_image_path = str(save_path)
+                except Exception as e:
+                    logger.error(f"Error downloading image media: {e}")
 
         # Fetch reply context if message is reply and text is needed
         reply_context = None
-        needs_text = any(p.mode in (PairMode.TEXT, PairMode.BOTH) for p in matching_pairs)
-        if event.is_reply and needs_text:
+        needs_text = any(p.mode in (PairMode.TEXT, PairMode.BOTH) for p in eligible_pairs)
+        is_reply = getattr(message, "is_reply", False)
+        if callable(is_reply):
             try:
-                reply_msg = await event.get_reply_message()
-                if reply_msg and reply_msg.raw_text:
+                is_reply = is_reply()
+            except Exception:
+                is_reply = False
+
+        if is_reply and needs_text and hasattr(message, "get_reply_message"):
+            try:
+                reply_msg = await message.get_reply_message()
+                if reply_msg and getattr(reply_msg, "raw_text", None):
                     reply_context = reply_msg.raw_text
             except Exception as e:
                 logger.warning(f"Could not fetch reply context: {e}")
 
+        # Extract message timestamp
+        msg_date = getattr(message, "date", None)
+        if msg_date:
+            if msg_date.tzinfo is None:
+                msg_date = msg_date.replace(tzinfo=datetime.timezone.utc)
+            timestamp = msg_date.timestamp()
+            date_display = msg_date.strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            timestamp = time.time()
+            date_display = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+
+        tag = "[PAST]" if is_past else "[LIVE]"
+
         # Dispatch to respective pairs
-        for pair in matching_pairs:
+        for pair in eligible_pairs:
             q = self.pair_queues.get(pair.id)
             if not q:
                 continue
+
+            task: Optional[TaskMessage] = None
 
             if pair.mode == PairMode.IMAGE:
                 if downloaded_image_path:
@@ -203,12 +342,10 @@ class MasterTelegramDispatcher:
                         message_id=message.id,
                         image_path=downloaded_image_path,
                         caption=text_content,
-                        timestamp=time.time()
+                        timestamp=timestamp
                     )
-                    q.put(task)
-                    logger.info(f"Dispatched Image Task to Pair #{pair.id} [{pair.name}] Queue")
                 else:
-                    logger.debug(f"Pair #{pair.id} [{pair.name}] is IMAGE mode, but received text-only message #{message.id}. Skipping.")
+                    logger.debug(f"{tag} Pair #{pair.id} [{pair.name}] is IMAGE mode, but Msg #{message.id} has no image. Skipping.")
 
             elif pair.mode == PairMode.TEXT:
                 if text_content and text_content.strip():
@@ -219,15 +356,12 @@ class MasterTelegramDispatcher:
                         message_id=message.id,
                         text=text_content,
                         reply_to_text=reply_context,
-                        timestamp=time.time()
+                        timestamp=timestamp
                     )
-                    q.put(task)
-                    logger.info(f"Dispatched Text Task to Pair #{pair.id} [{pair.name}] Queue")
                 else:
-                    logger.debug(f"Pair #{pair.id} [{pair.name}] is TEXT mode, but received image-only message #{message.id}. Skipping.")
+                    logger.debug(f"{tag} Pair #{pair.id} [{pair.name}] is TEXT mode, but Msg #{message.id} has no text. Skipping.")
 
             elif pair.mode == PairMode.BOTH:
-                # If image exists, prioritize image task; else if text exists, dispatch text task
                 if downloaded_image_path:
                     task = TaskMessage(
                         task_type=TaskType.IMAGE_TASK,
@@ -236,10 +370,8 @@ class MasterTelegramDispatcher:
                         message_id=message.id,
                         image_path=downloaded_image_path,
                         caption=text_content,
-                        timestamp=time.time()
+                        timestamp=timestamp
                     )
-                    q.put(task)
-                    logger.info(f"Dispatched Image Task to Pair #{pair.id} [{pair.name}] Queue (BOTH mode)")
                 elif text_content and text_content.strip():
                     task = TaskMessage(
                         task_type=TaskType.TEXT_TASK,
@@ -248,7 +380,10 @@ class MasterTelegramDispatcher:
                         message_id=message.id,
                         text=text_content,
                         reply_to_text=reply_context,
-                        timestamp=time.time()
+                        timestamp=timestamp
                     )
-                    q.put(task)
-                    logger.info(f"Dispatched Text Task to Pair #{pair.id} [{pair.name}] Queue (BOTH mode)")
+
+            if task:
+                q.put(task)
+                self.dispatched_msg_ids[pair.id].add(message.id)
+                logger.info(f"{tag} Dispatched {task.task_type.value.upper()} Task (Msg #{message.id} | {date_display}) to Pair #{pair.id} [{pair.name}] Queue")

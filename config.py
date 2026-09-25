@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from dotenv import load_dotenv
 
 from models import PairConfig, PairMode
@@ -17,6 +17,22 @@ else:
     load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+def parse_past_hours(val: Any) -> float:
+    """Parse past_hours from env or dict. Returns 0.0 if blank, None, <=0, or invalid."""
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return max(0.0, float(val))
+    str_val = str(val).strip()
+    if not str_val:
+        return 0.0
+    try:
+        hours = float(str_val)
+        return max(0.0, hours)
+    except (ValueError, TypeError):
+        logger.warning(f"Invalid past_hours value '{val}'. Defaulting to 0.0 (disabled).")
+        return 0.0
 
 class Settings:
     BASE_DIR: Path = BASE_DIR
@@ -132,6 +148,9 @@ class Settings:
                         elif mode_str in ("both", "all"):
                             mode = PairMode.BOTH
 
+                        past_hours_raw = p.get("past_hours", p.get("fetch_past_hours", p.get("read_past_hours")))
+                        past_hours = parse_past_hours(past_hours_raw)
+
                         pairs.append(
                             PairConfig(
                                 id=idx,
@@ -151,6 +170,7 @@ class Settings:
                                 lot_us30=p.get("lot_us30"),
                                 lot_forex=p.get("lot_forex"),
                                 lot_default=p.get("lot_default"),
+                                past_hours=past_hours,
                             )
                         )
                     if pairs:
@@ -199,6 +219,19 @@ class Settings:
             lot_forex = float(os.getenv(f"PAIR_{i}_LOT_FOREX")) if os.getenv(f"PAIR_{i}_LOT_FOREX") else None
             lot_default = float(os.getenv(f"PAIR_{i}_LOT_DEFAULT")) if os.getenv(f"PAIR_{i}_LOT_DEFAULT") else None
 
+            # Past hours configuration (set to >0 to retrieve past hours chat, blank/0 to disable)
+            past_hours_raw = None
+            for pk in (f"PAIR_{i}_PAST_HOURS", f"PAIR_{i}_FETCH_PAST_HOURS", f"PAIR_{i}_READ_PAST_HOURS"):
+                if pk in os.environ:
+                    past_hours_raw = os.environ[pk]
+                    break
+            if past_hours_raw is None:
+                for gk in ("PAST_HOURS", "FETCH_PAST_HOURS", "READ_PAST_HOURS"):
+                    if gk in os.environ:
+                        past_hours_raw = os.environ[gk]
+                        break
+            past_hours = parse_past_hours(past_hours_raw)
+
             pairs.append(
                 PairConfig(
                     id=i,
@@ -218,6 +251,7 @@ class Settings:
                     lot_us30=lot_us30,
                     lot_forex=lot_forex,
                     lot_default=lot_default,
+                    past_hours=past_hours,
                 )
             )
 
@@ -227,6 +261,13 @@ class Settings:
             legacy_chan = os.getenv("TELEGRAM_CHANNEL", "").strip()
             legacy_mode = os.getenv("PAIR_MODE", "image").strip().lower()
             if legacy_path or legacy_chan:
+                legacy_past_hours_raw = None
+                for gk in ("PAST_HOURS", "FETCH_PAST_HOURS", "READ_PAST_HOURS"):
+                    if gk in os.environ:
+                        legacy_past_hours_raw = os.environ[gk]
+                        break
+                legacy_past_hours = parse_past_hours(legacy_past_hours_raw)
+
                 pairs.append(
                     PairConfig(
                         id=1,
@@ -235,6 +276,7 @@ class Settings:
                         mt5_path=legacy_path,
                         mode=PairMode.TEXT if legacy_mode == "text" else PairMode.IMAGE,
                         magic_number=int(os.getenv("MT5_MAGIC_NUMBER", "777999")),
+                        past_hours=legacy_past_hours,
                     )
                 )
 

@@ -94,6 +94,14 @@ PAIR_2_MAGIC=888123
 - `text`: Parses direct text signals (buy/sell, update SL, update TP, breakeven, close partial, exit) using AI and regex rules (TWM bot logic).
 - `both`: Supports both images and text messages on the same channel.
 
+### 🕒 Reading Past Messages on Startup (Per-Pair Option)
+Each pair can independently retrieve chat messages posted in the channel prior to application launch:
+- Set `PAIR_<N>_PAST_HOURS=<number>` in `.env` (e.g. `PAIR_1_PAST_HOURS=2` or `PAIR_2_PAST_HOURS=4`).
+- When the bot starts, it fetches messages from the specified past hours, orders them chronologically (oldest to newest), processes them through the pair's engine, and then seamlessly transitions to live listening.
+- If left **blank** (`PAIR_<N>_PAST_HOURS=`) or set to **0** (`PAIR_<N>_PAST_HOURS=0`), past message retrieval is disabled for that pair and only new live messages are processed.
+- Built-in deduplication ensures no past message will ever be re-executed if received again in live events.
+
+
 ---
 
 ## 📊 Dynamic Lot Size Configuration

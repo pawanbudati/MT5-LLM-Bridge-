@@ -40,5 +40,49 @@ class TestConfig(unittest.TestCase):
         self.assertIn("USOIL", mappings)
         self.assertIn("BTCUSD", mappings)
 
+    def test_parse_past_hours(self):
+        from config import parse_past_hours
+        self.assertEqual(parse_past_hours(None), 0.0)
+        self.assertEqual(parse_past_hours(""), 0.0)
+        self.assertEqual(parse_past_hours("   "), 0.0)
+        self.assertEqual(parse_past_hours(0), 0.0)
+        self.assertEqual(parse_past_hours("0"), 0.0)
+        self.assertEqual(parse_past_hours("0.0"), 0.0)
+        self.assertEqual(parse_past_hours(-5), 0.0)
+        self.assertEqual(parse_past_hours("-2.5"), 0.0)
+        self.assertEqual(parse_past_hours("invalid"), 0.0)
+        self.assertEqual(parse_past_hours(2), 2.0)
+        self.assertEqual(parse_past_hours("2"), 2.0)
+        self.assertEqual(parse_past_hours("4.5"), 4.5)
+        self.assertEqual(parse_past_hours(24), 24.0)
+
+    def test_past_hours_pair_env(self):
+        old_val = os.environ.get("PAIR_1_PAST_HOURS")
+        try:
+            # Set to 5 hours
+            os.environ["PAIR_1_PAST_HOURS"] = "5"
+            pairs = settings.get_configured_pairs()
+            p1 = next((p for p in pairs if p.id == 1), None)
+            self.assertIsNotNone(p1)
+            self.assertEqual(p1.past_hours, 5.0)
+
+            # Set to blank
+            os.environ["PAIR_1_PAST_HOURS"] = ""
+            pairs = settings.get_configured_pairs()
+            p1 = next((p for p in pairs if p.id == 1), None)
+            self.assertEqual(p1.past_hours, 0.0)
+
+            # Set to 0
+            os.environ["PAIR_1_PAST_HOURS"] = "0"
+            pairs = settings.get_configured_pairs()
+            p1 = next((p for p in pairs if p.id == 1), None)
+            self.assertEqual(p1.past_hours, 0.0)
+        finally:
+            if old_val is not None:
+                os.environ["PAIR_1_PAST_HOURS"] = old_val
+            else:
+                os.environ.pop("PAIR_1_PAST_HOURS", None)
+
 if __name__ == "__main__":
     unittest.main()
+
