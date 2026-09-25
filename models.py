@@ -56,6 +56,8 @@ class GeminiChartAnalysis(BaseModel):
     key_levels_found: List[str] = Field(default_factory=list, description="List of notable support/resistance levels detected")
     confidence: Optional[str] = Field(default="MEDIUM", description="Confidence level: HIGH, MEDIUM, LOW")
     analysis_summary: str = Field(default="", description="Concise description of trade setup")
+    is_profit_recap: bool = Field(default=False, description="True if image is a celebration/profit/recap of an already executed or completed trade")
+    trade_already_triggered: bool = Field(default=False, description="True if chart indicates the trade already broke out / was entered in the past")
 
 class TradeSignal(BaseModel):
     action: SignalAction = SignalAction.NONE
@@ -140,6 +142,7 @@ class BreakoutWatchSetup(BaseModel):
     created_at: float = 0.0
     status: str = "WATCHING"  # WATCHING, TRIGGERED_BUY, TRIGGERED_SELL, EXPIRED, CANCELLED, SUPERSEDED
     summary: str = ""
+    image_hash: Optional[str] = None
 
 class PairMode(str, Enum):
     IMAGE = "image"

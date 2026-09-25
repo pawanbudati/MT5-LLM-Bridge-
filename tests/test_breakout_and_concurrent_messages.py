@@ -43,6 +43,7 @@ class TestBreakoutAndConcurrentMessages(unittest.TestCase):
         """Verify that BreakoutMonitor tracks multiple different instruments concurrently."""
         mock_bridge = MagicMock()
         mock_bridge.calculate_lot.return_value = 0.02
+        mock_bridge.get_open_positions.return_value = []
 
         monitor = BreakoutMonitor(mock_bridge)
 
@@ -149,6 +150,127 @@ class TestBreakoutAndConcurrentMessages(unittest.TestCase):
         self.assertEqual(q.qsize(), 1, "Edited message must be dispatched")
         task = q.get()
         self.assertIn("BUY GOLD 2655", task.text)
+
+    def test_smart_ignore_when_trade_already_triggered(self):
+        """Verify that when a setup was already executed, re-sharing the same chart/levels is smartly ignored."""
+        mock_bridge = MagicMock()
+        mock_bridge.calculate_lot.return_value = 0.02
+        mock_bridge.get_open_positions.return_value = []
+
+        monitor = BreakoutMonitor(mock_bridge)
+
+        setup_btc = BreakoutWatchSetup(
+            setup_id="watch_BTCUSD_10",
+            instrument="BTCUSD",
+            broker_symbol="BTCUSD#",
+            upper_breakout_level=65000.0,
+            lower_breakout_level=64000.0,
+            image_hash="hash_abc_123"
+        )
+
+        with patch("MetaTrader5.symbol_info_tick", return_value=MagicMock(bid=64500.0, ask=64505.0)), \
+             patch("MetaTrader5.terminal_info", return_value=None):
+            monitor.add_setup(setup_btc)
+            self.assertEqual(len(monitor.active_setups), 1)
+
+            # Simulate breakout triggering BUY
+            monitor.record_triggered_setup(setup_btc, "BUY")
+            del monitor.active_setups[setup_btc.setup_id]
+
+        # Admin posts the same successful breakout image later celebrating profit
+        reposted_setup = BreakoutWatchSetup(
+            setup_id="watch_BTCUSD_11",
+            instrument="BTCUSD",
+            broker_symbol="BTCUSD#",
+            upper_breakout_level=65000.0,
+            lower_breakout_level=64000.0,
+            image_hash="hash_abc_123"
+        )
+        with patch("MetaTrader5.symbol_info_tick", return_value=MagicMock(bid=65400.0, ask=65405.0)), \
+             patch("MetaTrader5.terminal_info", return_value=None):
+            monitor.add_setup(reposted_setup, caption="BTCUSD BOOM +400 pips running in profit!")
+
+        # It must NOT be added to active setups
+        self.assertEqual(len(monitor.active_setups), 0, "Duplicate/profit recap setup must be smartly ignored")
+
+    def test_smart_ignore_when_open_position_running_in_profit(self):
+        """Verify that when MT5 already has an active profitable position on a symbol and price is past breakout, setup is ignored."""
+        mock_pos = MagicMock()
+        mock_pos.type = 0  # POSITION_TYPE_BUY
+        mock_pos.profit = 25.50
+
+        mock_bridge = MagicMock()
+        mock_bridge.calculate_lot.return_value = 0.02
+        mock_bridge.get_open_positions.return_value = [mock_pos]
+
+        monitor = BreakoutMonitor(mock_bridge)
+
+        setup_gold = BreakoutWatchSetup(
+            setup_id="watch_GOLD_20",
+            instrument="GOLD",
+            broker_symbol="GOLD.i#",
+            upper_breakout_level=2650.0,
+            lower_breakout_level=2635.0
+        )
+
+        # Current price is 2655 (past the 2650 breakout level)
+        with patch("MetaTrader5.symbol_info_tick", return_value=MagicMock(bid=2654.5, ask=2655.0)), \
+             patch("MetaTrader5.terminal_info", return_value=None), \
+             patch("MetaTrader5.POSITION_TYPE_BUY", 0):
+            monitor.add_setup(setup_gold, caption="GOLD TP1 Hit, running in profit!")
+
+        self.assertEqual(len(monitor.active_setups), 0, "Setup with existing profitable running position must be ignored")
+
+    def test_smart_ignore_gemini_recap_flag(self):
+        """Verify that when Gemini Vision identifies chart as a profit recap, it is ignored."""
+        mock_bridge = MagicMock()
+        mock_bridge.get_open_positions.return_value = []
+        monitor = BreakoutMonitor(mock_bridge)
+
+        setup_oil = BreakoutWatchSetup(
+            setup_id="watch_USOIL_30",
+            instrument="USOIL",
+            broker_symbol="OILCash#",
+            upper_breakout_level=71.0,
+            lower_breakout_level=69.0
+        )
+        analysis = GeminiChartAnalysis(
+            is_valid_signal=True,
+            instrument="USOIL",
+            upper_breakout_level=71.0,
+            lower_breakout_level=69.0,
+            is_profit_recap=True,
+            trade_already_triggered=True
+        )
+
+        with patch("MetaTrader5.symbol_info_tick", return_value=MagicMock(bid=70.0, ask=70.05)), \
+             patch("MetaTrader5.terminal_info", return_value=None):
+            monitor.add_setup(setup_oil, analysis=analysis)
+
+        self.assertEqual(len(monitor.active_setups), 0, "Profit recap chart must be ignored")
+
+    def test_cancel_pending_breakout_when_direct_signal_arrives(self):
+        """Verify that cancel_setup_for_symbol invalidates pending breakout observation."""
+        mock_bridge = MagicMock()
+        mock_bridge.get_open_positions.return_value = []
+        monitor = BreakoutMonitor(mock_bridge)
+
+        setup = BreakoutWatchSetup(
+            setup_id="watch_BTCUSD_40",
+            instrument="BTCUSD",
+            broker_symbol="BTCUSD#",
+            upper_breakout_level=65000.0,
+            lower_breakout_level=64000.0
+        )
+        with patch("MetaTrader5.symbol_info_tick", return_value=MagicMock(bid=64500.0, ask=64505.0)), \
+             patch("MetaTrader5.terminal_info", return_value=None):
+            monitor.add_setup(setup)
+            self.assertIn("watch_BTCUSD_40", monitor.active_setups)
+
+            # Direct signal arrives for BTCUSD
+            monitor.cancel_setup_for_symbol("BTCUSD#", instrument="BTCUSD", reason="SUPERSEDED_BY_DIRECT_SIGNAL")
+
+        self.assertEqual(len(monitor.active_setups), 0, "Pending breakout must be cancelled by cancel_setup_for_symbol")
 
 
 if __name__ == "__main__":

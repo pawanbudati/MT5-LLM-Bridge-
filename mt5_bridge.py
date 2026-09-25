@@ -628,6 +628,30 @@ class MT5Bridge:
                 comment=f"MT5 rejected pending order: {res.comment} (retcode: {res.retcode})"
             )
 
+    def get_open_positions(self, symbol: Optional[str] = None) -> List[Any]:
+        """Retrieve open positions optionally filtered by symbol and pair magic number."""
+        if not self.ensure_connected():
+            return []
+        try:
+            if symbol:
+                positions = mt5.positions_get(symbol=symbol)
+            else:
+                positions = mt5.positions_get()
+            if not positions:
+                return []
+            if self.magic_number:
+                filtered = [p for p in positions if p.magic == self.magic_number]
+                return filtered if filtered else list(positions)
+            return list(positions)
+        except Exception as e:
+            logger.debug(f"Error fetching open positions: {e}")
+            return []
+
+    def has_running_position(self, symbol: str) -> bool:
+        """Check if an open position is currently active for this symbol."""
+        positions = self.get_open_positions(symbol)
+        return len(positions) > 0
+
     def _modify_sl(self, symbol: str, symbol_info, new_sl: Optional[float]) -> ExecutionResult:
         """Modify stop loss for open positions on this symbol."""
         if new_sl is None:

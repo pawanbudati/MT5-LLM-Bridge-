@@ -3,7 +3,7 @@ import json
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple, Any
 import MetaTrader5 as mt5
 from colorama import Fore, Style
 
@@ -18,11 +18,167 @@ class BreakoutMonitor:
         self.active_setups: Dict[str, BreakoutWatchSetup] = {}
         self.running: bool = False
         self._last_heartbeat_time: float = 0.0
+        # History of recent breakout executions for smart deduplication & profit-recap ignoring
+        self.triggered_history: List[Dict[str, Any]] = []
 
-    def add_setup(self, setup: BreakoutWatchSetup):
+    def record_triggered_setup(self, setup: BreakoutWatchSetup, direction: str):
+        """Record an executed setup in triggered history for smart deduplication."""
+        self.triggered_history.append({
+            "setup_id": setup.setup_id,
+            "instrument": setup.instrument.upper(),
+            "broker_symbol": setup.broker_symbol,
+            "direction": direction,
+            "upper_trigger": setup.upper_breakout_level,
+            "lower_trigger": setup.lower_breakout_level,
+            "upper_tp": setup.upper_take_profit,
+            "lower_tp": setup.lower_take_profit,
+            "sl": setup.upper_stop_loss if direction == "BUY" else setup.lower_stop_loss,
+            "tp": setup.upper_take_profit if direction == "BUY" else setup.lower_take_profit,
+            "image_hash": getattr(setup, "image_hash", None),
+            "timestamp": time.time()
+        })
+        if len(self.triggered_history) > 50:
+            self.triggered_history.pop(0)
+
+    def cancel_setup_for_symbol(self, broker_symbol: str, instrument: str = "", reason: str = "SUPERSEDED"):
+        """Cancel and remove any active breakout watching setup for a symbol/instrument."""
+        clean_target = instrument.upper().strip() if instrument else ""
+        cancelled_any = False
+        for s_id, s in list(self.active_setups.items()):
+            if s.broker_symbol == broker_symbol or (clean_target and s.instrument.upper() == clean_target):
+                logger.info(
+                    Fore.YELLOW + Style.BRIGHT + 
+                    f"\n[CANCELLED SETUP] Breakout watcher for {s.instrument} ({s.broker_symbol}) cancelled. Reason: {reason}" + 
+                    Style.RESET_ALL
+                )
+                s.status = reason
+                self._write_ea_task_file(s, reason)
+                del self.active_setups[s_id]
+                cancelled_any = True
+
+        if cancelled_any:
+            self.bridge.cancel_pending_orders(broker_symbol)
+
+    def check_smart_ignore(
+        self,
+        setup: BreakoutWatchSetup,
+        analysis: Optional[Any] = None,
+        caption: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """
+        Check if incoming chart setup should be smartly ignored because the trade
+        was already triggered, is currently running in profit, or is a profit celebration.
+        """
+        now = time.time()
+        caption_upper = (caption or "").upper()
+
+        # Profit celebration keywords commonly posted when a trade is already successful
+        profit_keywords = [
+            "RUNNING IN PROFIT", "RUNNING PROFIT", "PIPS RUNNING", "BOOM",
+            "TP HIT", "TP1 HIT", "TP2 HIT", "TP3 HIT", "TARGET HIT", "TARGET 1 HIT",
+            "TARGET REACHED", "ENJOY THE PROFIT", "ENJOY PROFIT", "BOOK PROFIT",
+            "BOOK PARTIAL", "CLOSED IN PROFIT", "RISK FREE", "MOVE SL", "COST HIT", "SMASHED"
+        ]
+        has_profit_caption = any(kw in caption_upper for kw in profit_keywords)
+
+        # 1. Check Gemini analysis flags
+        if analysis:
+            if getattr(analysis, "is_profit_recap", False) or getattr(analysis, "trade_already_triggered", False):
+                return True, "Gemini Vision identified chart as an in-profit celebration / already triggered trade recap."
+
+        # 2. Check MT5 open positions
+        open_positions = self.bridge.get_open_positions(setup.broker_symbol)
+        tick = mt5.symbol_info_tick(setup.broker_symbol)
+        current_price = ((tick.bid + tick.ask) / 2.0) if tick else setup.initial_price
+
+        if open_positions:
+            buy_positions = [p for p in open_positions if getattr(p, "type", None) == mt5.POSITION_TYPE_BUY]
+            sell_positions = [p for p in open_positions if getattr(p, "type", None) == mt5.POSITION_TYPE_SELL]
+
+            # If we have an open BUY position on this symbol:
+            if buy_positions:
+                total_profit = sum(getattr(p, "profit", 0.0) for p in buy_positions)
+                if (setup.upper_breakout_level and current_price >= setup.upper_breakout_level) or total_profit > 0 or has_profit_caption:
+                    return True, (
+                        f"Active BUY trade is already running in MT5 on {setup.broker_symbol} "
+                        f"(Profit: +${total_profit:.2f}, Price: {current_price:.4f} >= Trigger: {setup.upper_breakout_level}). "
+                        f"Ignoring shared profit/recap image."
+                    )
+
+            # If we have an open SELL position on this symbol:
+            if sell_positions:
+                total_profit = sum(getattr(p, "profit", 0.0) for p in sell_positions)
+                if (setup.lower_breakout_level and current_price <= setup.lower_breakout_level) or total_profit > 0 or has_profit_caption:
+                    return True, (
+                        f"Active SELL trade is already running in MT5 on {setup.broker_symbol} "
+                        f"(Profit: +${total_profit:.2f}, Price: {current_price:.4f} <= Trigger: {setup.lower_breakout_level}). "
+                        f"Ignoring shared profit/recap image."
+                    )
+
+        # 3. Check recently triggered breakout history (cooldown: last 8 hours)
+        for rec in reversed(self.triggered_history):
+            if (rec["broker_symbol"] == setup.broker_symbol or 
+                rec["instrument"].upper() == setup.instrument.upper()):
+                time_diff = now - rec["timestamp"]
+                if time_diff < 28800:  # 8 hours
+                    # A) Identical image hash
+                    if setup.image_hash and rec.get("image_hash") and setup.image_hash == rec["image_hash"]:
+                        time_str = time.strftime('%H:%M:%S', time.localtime(rec['timestamp']))
+                        return True, (
+                            f"Image is identical to setup #{rec['setup_id']} which already triggered "
+                            f"{rec['direction']} order at {time_str}. Ignoring reposted success chart."
+                        )
+
+                    # B) Matching breakout trigger levels (within 0.25% threshold)
+                    levels_match = False
+                    if setup.upper_breakout_level and rec.get("upper_trigger"):
+                        diff_pct = abs(setup.upper_breakout_level - rec["upper_trigger"]) / rec["upper_trigger"]
+                        if diff_pct < 0.0025:
+                            levels_match = True
+                    if setup.lower_breakout_level and rec.get("lower_trigger"):
+                        diff_pct = abs(setup.lower_breakout_level - rec["lower_trigger"]) / rec["lower_trigger"]
+                        if diff_pct < 0.0025:
+                            levels_match = True
+
+                    if levels_match:
+                        time_str = time.strftime('%H:%M:%S', time.localtime(rec['timestamp']))
+                        return True, (
+                            f"Breakout levels match recently triggered setup #{rec['setup_id']} "
+                            f"({rec['direction']} trade triggered at {time_str}). "
+                            f"Trade is already executed/running. Ignoring duplicate."
+                        )
+
+        # 4. Check if market price is already way past take profit (late image / already completed)
+        if tick:
+            if setup.upper_take_profit and current_price >= setup.upper_take_profit:
+                return True, (
+                    f"Market price ({current_price:.4f}) has already reached or exceeded Upper TP "
+                    f"({setup.upper_take_profit}). Breakout already completed."
+                )
+            if setup.lower_take_profit and current_price <= setup.lower_take_profit:
+                return True, (
+                    f"Market price ({current_price:.4f}) has already reached or exceeded Lower TP "
+                    f"({setup.lower_take_profit}). Breakdown already completed."
+                )
+
+        return False, ""
+
+    def add_setup(self, setup: BreakoutWatchSetup, analysis: Optional[Any] = None, caption: Optional[str] = None):
         """Add a new chart range/breakout setup to active real-time observation."""
         if not setup.upper_breakout_level and not setup.lower_breakout_level:
             logger.warning(f"Setup {setup.setup_id} has neither upper nor lower breakout level. Skipping.")
+            return
+
+        # Check if setup should be smartly ignored (already triggered, running in profit, etc.)
+        is_ignore, reason = self.check_smart_ignore(setup, analysis=analysis, caption=caption)
+        if is_ignore:
+            logger.info(
+                Fore.YELLOW + Style.BRIGHT + 
+                f"\n[SMART IGNORE] Skipping breakout setup for {setup.instrument} ({setup.broker_symbol}):\n"
+                f"  -> {reason}\n"
+                f"  -> Trade is already running or completed. No duplicate entry placed." + 
+                Style.RESET_ALL
+            )
             return
 
         # Check if an analysis for the same chart/symbol is already pending
@@ -31,12 +187,13 @@ class BreakoutMonitor:
                 existing.instrument.upper() == setup.instrument.upper()):
                 logger.info(
                     Fore.YELLOW + Style.BRIGHT + 
-                    f"\n[SUPERSEDED] Existing pending analysis for {setup.instrument} ({setup.broker_symbol}) detected!\n"
+                    f"\n[CANCELLED & SUPERSEDED] Existing pending analysis for {setup.instrument} ({setup.broker_symbol}) detected!\n"
                     f"  -> Invalidating previous setup #{existing_id}\n"
                     f"  -> Adopting latest chart analysis as active execution plan." + 
                     Style.RESET_ALL
                 )
                 existing.status = "SUPERSEDED"
+                self._write_ea_task_file(existing, "SUPERSEDED")
                 del self.active_setups[existing_id]
 
         # Cancel any existing pending broker orders for this symbol on MT5
@@ -213,6 +370,8 @@ class BreakoutMonitor:
                     Style.RESET_ALL
                 )
                 setup.status = ea_status
+                ea_dir = "BUY" if "BUY" in ea_status else "SELL"
+                self.record_triggered_setup(setup, ea_dir)
                 del self.active_setups[setup_id]
                 continue
 
@@ -244,6 +403,7 @@ class BreakoutMonitor:
                     )
                     setup.status = "TRIGGERED_BUY"
                     self._write_ea_task_file(setup, "TRIGGERED_BUY")
+                    self.record_triggered_setup(setup, "BUY")
                     
                     result = self.bridge.execute_market_trade(
                         symbol=setup.broker_symbol,
@@ -271,6 +431,7 @@ class BreakoutMonitor:
                     )
                     setup.status = "TRIGGERED_SELL"
                     self._write_ea_task_file(setup, "TRIGGERED_SELL")
+                    self.record_triggered_setup(setup, "SELL")
 
                     result = self.bridge.execute_market_trade(
                         symbol=setup.broker_symbol,

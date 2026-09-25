@@ -57,6 +57,11 @@ Examine the following elements thoroughly:
    - Determine order_type: MARKET, LIMIT, or STOP.
    - If the image is not a trading chart setup (e.g., profit screenshot, meme, promotional banner, chat scrap), set is_valid_signal to false and action to NONE.
 
+7. COMPLETED TRADE / PROFIT RECAP DETECTION:
+   - Often channels re-share a chart AFTER the breakout or entry already occurred to celebrate the win (e.g., price has already broken out and hit TP/targets, chart caption says "TP1 Hit", "running in profit", "+50 pips", "Boom", "Enjoy profit").
+   - If the chart shows a trade that has ALREADY broken out or already reached targets/completed, set `is_profit_recap: true` and `trade_already_triggered: true`.
+   - If the chart is an upcoming / fresh trade waiting for breakout, set both to false.
+
 Output MUST be strictly valid JSON matching this schema:
 {
   "is_valid_signal": true,
@@ -88,7 +93,9 @@ Output MUST be strictly valid JSON matching this schema:
   },
   "key_levels_found": ["Upper range 95.80", "Lower range 94.50", "Target 96.10"],
   "confidence": "HIGH",
-  "analysis_summary": "Range breakout analysis on USOIL 15m. Watching upper breakout at 95.80 and lower breakdown at 94.50."
+  "analysis_summary": "Range breakout analysis on USOIL 15m. Watching upper breakout at 95.80 and lower breakdown at 94.50.",
+  "is_profit_recap": false,
+  "trade_already_triggered": false
 }
 """
 
@@ -280,7 +287,9 @@ class GeminiVisionClient:
                 lower_take_profit=parsed_json.get("lower_take_profit"),
                 key_levels_found=parsed_json.get("key_levels_found", []),
                 confidence=parsed_json.get("confidence", "MEDIUM"),
-                analysis_summary=parsed_json.get("analysis_summary", "")
+                analysis_summary=parsed_json.get("analysis_summary", ""),
+                is_profit_recap=bool(parsed_json.get("is_profit_recap", False)),
+                trade_already_triggered=bool(parsed_json.get("trade_already_triggered", False))
             )
         except Exception as e:
             logger.error(f"Error parsing Gemini response: {e}")

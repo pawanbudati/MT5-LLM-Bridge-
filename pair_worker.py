@@ -1,6 +1,7 @@
 import sys
 import time
 import queue
+import hashlib
 import asyncio
 import logging
 from pathlib import Path
@@ -113,13 +114,21 @@ class PairWorker:
             logger.error(f"Image file does not exist: {task.image_path}")
             return
 
+        # Compute image hash for duplicate/recap identification
+        image_hash = None
+        if task.image_path and Path(task.image_path).exists():
+            try:
+                with open(task.image_path, "rb") as f:
+                    image_hash = hashlib.sha256(f.read()).hexdigest()
+            except Exception:
+                pass
+
         logger.info("Extracting chart information with Gemini Vision AI...")
         analysis: GeminiChartAnalysis = await asyncio.to_thread(
             self.gemini.analyze_chart,
             task.image_path,
             task.caption
         )
-
 
         self._print_analysis_report(analysis)
 
@@ -142,16 +151,28 @@ class PairWorker:
                     lower_stop_loss=analysis.lower_stop_loss,
                     lower_take_profit=analysis.lower_take_profit,
                     lot=calc_lot,
-                    summary=analysis.analysis_summary
+                    summary=analysis.analysis_summary,
+                    image_hash=image_hash
                 )
-                self.breakout_monitor.add_setup(setup)
+                self.breakout_monitor.add_setup(setup, analysis=analysis, caption=task.caption)
                 return
             else:
                 logger.error(f"Could not resolve broker symbol for '{analysis.instrument}' to watch breakout!")
 
         if analysis.is_valid_signal and analysis.action != SignalAction.NONE and analysis.instrument:
+            if analysis.is_profit_recap or analysis.trade_already_triggered:
+                logger.info(
+                    Fore.YELLOW + Style.BRIGHT + 
+                    f"\n[SMART IGNORE] Chart analyzed as a profit celebration/recap of an already executed {analysis.instrument} trade. "
+                    f"No duplicate market order will be placed." + 
+                    Style.RESET_ALL
+                )
+                return
+
             broker_sym = self.bridge.resolve_symbol(analysis.instrument)
             if broker_sym:
+                if self.breakout_monitor:
+                    self.breakout_monitor.cancel_setup_for_symbol(broker_sym, instrument=analysis.instrument, reason="SUPERSEDED_BY_DIRECT_SIGNAL")
                 self.bridge.cancel_pending_orders(broker_sym)
 
             tp_target = analysis.take_profit_1
@@ -218,6 +239,11 @@ class PairWorker:
         if signal.action == SignalAction.NONE:
             logger.info("Message evaluated as non-actionable. No trade taken.")
             return
+
+        if signal.symbol:
+            broker_sym = self.bridge.resolve_symbol(signal.symbol)
+            if broker_sym and self.breakout_monitor:
+                self.breakout_monitor.cancel_setup_for_symbol(broker_sym, instrument=signal.symbol, reason="SUPERSEDED_BY_TEXT_SIGNAL")
 
         result = self.bridge.execute_signal(signal)
         if result.success:
