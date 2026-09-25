@@ -53,10 +53,16 @@ class MasterTelegramDispatcher:
         # 1. Fetch and process past messages for configured pairs before starting live listening
         await self._fetch_and_process_past_messages()
 
-        # 2. Register unified live new message event handler
-        @self.client.on(events.NewMessage(chats=self.subscribed_entities))
+        # 2. Register unified live new message & edited message event handlers
+        # Handlers are registered without chats filter so Telethon never drops updates due to peer ID discrepancies.
+        # Routing and channel matching are handled reliably in _handle_incoming_event.
+        @self.client.on(events.NewMessage())
         async def on_new_message(event):
-            await self._handle_incoming_event(event)
+            await self._handle_incoming_event(event, is_edit=False)
+
+        @self.client.on(events.MessageEdited())
+        async def on_message_edited(event):
+            await self._handle_incoming_event(event, is_edit=True)
 
         logger.info(Fore.GREEN + Style.BRIGHT + "\n" + "=" * 70)
         logger.info(f" [*] MASTER TELEGRAM LISTENER ACTIVE - LISTENING TO {len(self.subscribed_entities)} CHANNELS")
@@ -210,33 +216,83 @@ class MasterTelegramDispatcher:
 
         logger.info(Fore.CYAN + " [*] Finished retrieving past messages. Transitioning to live listening...\n" + Style.RESET_ALL)
 
-    async def _handle_incoming_event(self, event):
-        """Route incoming live message to subscribed pair queues."""
-        message = event.message
-        chat_id = event.chat_id
-        str_chat_id = str(chat_id)
+    async def _handle_incoming_event(self, event, is_edit: bool = False):
+        """Route incoming live or edited message to subscribed pair queues."""
+        message = getattr(event, 'message', None)
+        if not message:
+            return
 
-        # Find matching pairs
+        chat_id = getattr(event, 'chat_id', None)
+        if chat_id is None and hasattr(message, 'peer_id'):
+            try:
+                chat_id = telethon_utils.get_peer_id(message.peer_id)
+            except Exception:
+                chat_id = None
+
+        if chat_id is None:
+            return
+
+        str_chat_id = str(chat_id)
+        raw_id_str = str_chat_id.replace("-100", "").lstrip("-")
+
+        # Collect candidate lookup keys from event
+        lookup_keys = {str_chat_id, raw_id_str, f"-100{raw_id_str}", f"-{raw_id_str}"}
+
+        chat = getattr(event, 'chat', None)
+        if chat:
+            uname = getattr(chat, 'username', None)
+            if uname:
+                lookup_keys.add(uname.lower())
+                lookup_keys.add(f"@{uname.lower()}")
+            title = getattr(chat, 'title', None)
+            if title:
+                lookup_keys.add(title.lower())
+
+        # Match against channel_pairs_map
         matching_pairs: List[PairConfig] = []
-        for key in (str_chat_id, str_chat_id.replace("-100", ""), abs(chat_id)):
-            str_k = str(key)
-            if str_k in self.channel_pairs_map:
-                for p in self.channel_pairs_map[str_k]:
+        for k in lookup_keys:
+            if k in self.channel_pairs_map:
+                for p in self.channel_pairs_map[k]:
+                    if p not in matching_pairs:
+                        matching_pairs.append(p)
+
+        # Fallback check against configured pair channels directly
+        if not matching_pairs:
+            for p in self.pairs:
+                c_clean = p.channel.strip().lower()
+                c_bare = c_clean.lstrip("@").replace("-100", "").lstrip("-")
+                if (c_clean in lookup_keys or 
+                    c_bare in lookup_keys or 
+                    p.channel.strip() in lookup_keys):
                     if p not in matching_pairs:
                         matching_pairs.append(p)
 
         if not matching_pairs:
-            logger.debug(f"Received message from non-mapped chat {chat_id}. Ignoring.")
             return
 
-        await self._dispatch_message(message, matching_pairs=matching_pairs, chat_id=chat_id, is_past=False)
+        edit_tag = "[LIVE-EDIT]" if is_edit else "[LIVE]"
+        chat_name = getattr(chat, 'title', '') or getattr(chat, 'username', '') or str_chat_id
+        logger.info(
+            Fore.CYAN + 
+            f"{edit_tag} Event in '{chat_name}' (Chat ID: {str_chat_id} | Msg #{message.id}) -> Matched {len(matching_pairs)} Pair(s)" + 
+            Style.RESET_ALL
+        )
+
+        await self._dispatch_message(
+            message,
+            matching_pairs=matching_pairs,
+            chat_id=chat_id,
+            is_past=False,
+            is_edit=is_edit
+        )
 
     async def _dispatch_message(
         self,
         message: Any,
         matching_pairs: List[PairConfig],
         chat_id: Optional[Any] = None,
-        is_past: bool = False
+        is_past: bool = False,
+        is_edit: bool = False
     ):
         """Extract media/text from a message and dispatch TaskMessage to matching pair queues."""
         if chat_id is None:
@@ -248,11 +304,11 @@ class MasterTelegramDispatcher:
                     chat_id = None
         str_chat_id = str(chat_id or "")
 
-        # Filter out pairs that have already dispatched this message ID
+        # Filter out pairs that have already dispatched this message ID (allow reprocessing if edited)
         eligible_pairs: List[PairConfig] = []
         for p in matching_pairs:
             pair_dispatched = self.dispatched_msg_ids.setdefault(p.id, set())
-            if message.id in pair_dispatched:
+            if not is_edit and message.id in pair_dispatched:
                 logger.debug(f"Message #{message.id} already processed for Pair #{p.id} [{p.name}]. Skipping duplicate.")
             else:
                 eligible_pairs.append(p)
@@ -286,11 +342,16 @@ class MasterTelegramDispatcher:
             else:
                 save_path = settings.DOWNLOADS_DIR / f"chart_msg_{message.id}_{int(time.time())}{file_ext}"
                 try:
-                    tag = "[PAST]" if is_past else "[LIVE]"
+                    tag = "[PAST]" if is_past else ("[LIVE-EDIT]" if is_edit else "[LIVE]")
                     logger.info(f"{tag} Downloading image media from chat {chat_id} (Msg #{message.id})...")
-                    downloaded = await message.download_media(file=str(save_path))
+                    downloaded = await asyncio.wait_for(
+                        message.download_media(file=str(save_path)),
+                        timeout=30.0
+                    )
                     if downloaded:
                         downloaded_image_path = str(save_path)
+                except asyncio.TimeoutError:
+                    logger.error(f"Image download timed out after 30s for Msg #{message.id}")
                 except Exception as e:
                     logger.error(f"Error downloading image media: {e}")
 
@@ -323,7 +384,7 @@ class MasterTelegramDispatcher:
             timestamp = time.time()
             date_display = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
 
-        tag = "[PAST]" if is_past else "[LIVE]"
+        tag = "[PAST]" if is_past else ("[LIVE-EDIT]" if is_edit else "[LIVE]")
 
         # Dispatch to respective pairs
         for pair in eligible_pairs:
@@ -344,8 +405,18 @@ class MasterTelegramDispatcher:
                         caption=text_content,
                         timestamp=timestamp
                     )
+                elif text_content and text_content.strip():
+                    task = TaskMessage(
+                        task_type=TaskType.TEXT_TASK,
+                        pair_id=pair.id,
+                        channel_id=str_chat_id,
+                        message_id=message.id,
+                        text=text_content,
+                        reply_to_text=reply_context,
+                        timestamp=timestamp
+                    )
                 else:
-                    logger.debug(f"{tag} Pair #{pair.id} [{pair.name}] is IMAGE mode, but Msg #{message.id} has no image. Skipping.")
+                    logger.info(f"{tag} Pair #{pair.id} [{pair.name}] Msg #{message.id} has no image and no text content. Skipping.")
 
             elif pair.mode == PairMode.TEXT:
                 if text_content and text_content.strip():
@@ -358,8 +429,18 @@ class MasterTelegramDispatcher:
                         reply_to_text=reply_context,
                         timestamp=timestamp
                     )
+                elif downloaded_image_path:
+                    task = TaskMessage(
+                        task_type=TaskType.IMAGE_TASK,
+                        pair_id=pair.id,
+                        channel_id=str_chat_id,
+                        message_id=message.id,
+                        image_path=downloaded_image_path,
+                        caption=text_content,
+                        timestamp=timestamp
+                    )
                 else:
-                    logger.debug(f"{tag} Pair #{pair.id} [{pair.name}] is TEXT mode, but Msg #{message.id} has no text. Skipping.")
+                    logger.info(f"{tag} Pair #{pair.id} [{pair.name}] Msg #{message.id} has no text and no image. Skipping.")
 
             elif pair.mode == PairMode.BOTH:
                 if downloaded_image_path:
@@ -382,8 +463,15 @@ class MasterTelegramDispatcher:
                         reply_to_text=reply_context,
                         timestamp=timestamp
                     )
+                else:
+                    logger.info(f"{tag} Pair #{pair.id} [{pair.name}] Msg #{message.id} has no image and no text. Skipping.")
 
             if task:
                 q.put(task)
                 self.dispatched_msg_ids[pair.id].add(message.id)
-                logger.info(f"{tag} Dispatched {task.task_type.value.upper()} Task (Msg #{message.id} | {date_display}) to Pair #{pair.id} [{pair.name}] Queue")
+                logger.info(
+                    Fore.GREEN + 
+                    f"{tag} Dispatched {task.task_type.value.upper()} Task (Msg #{message.id} | {date_display}) "
+                    f"to Pair #{pair.id} [{pair.name}] Queue" + 
+                    Style.RESET_ALL
+                )

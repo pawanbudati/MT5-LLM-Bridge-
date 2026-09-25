@@ -48,19 +48,18 @@ class PairWorker:
         if not self.bridge.connect():
             logger.error(f"Worker could not connect to MT5 terminal: '{self.pair_cfg.mt5_path}'. Will retry on tasks.")
         
-        # 2. Initialize engines depending on mode
+        # 2. Initialize engines
         background_tasks = []
 
-        if self.pair_cfg.mode in (PairMode.IMAGE, PairMode.BOTH):
-            self.gemini = GeminiVisionClient()
-            self.breakout_monitor = BreakoutMonitor(self.bridge)
-            if settings.BREAKOUT_MONITOR_ENABLED:
-                t1 = asyncio.create_task(self.breakout_monitor.start())
-                background_tasks.append(t1)
-                logger.info("Real-time Chart Breakout Observer active in background.")
+        self.gemini = GeminiVisionClient()
+        self.breakout_monitor = BreakoutMonitor(self.bridge)
+        if settings.BREAKOUT_MONITOR_ENABLED:
+            t1 = asyncio.create_task(self.breakout_monitor.start())
+            background_tasks.append(t1)
+            logger.info("Real-time Chart Breakout Observer active in background.")
 
+        self.llm = LLMSignalEngine()
         if self.pair_cfg.mode in (PairMode.TEXT, PairMode.BOTH):
-            self.llm = LLMSignalEngine()
             t2 = asyncio.create_task(self.bridge.start_position_monitor())
             background_tasks.append(t2)
             logger.info("Position & Target monitor active in background.")
@@ -70,14 +69,13 @@ class PairWorker:
         # 3. Main task processing loop
         while not self.stop_event.is_set():
             try:
-                # Check for incoming task without blocking async loop
-                task: Optional[TaskMessage] = await asyncio.to_thread(self._get_task_nowait)
+                task: Optional[TaskMessage] = self._get_task_nowait()
                 if task:
                     await self._process_task(task)
             except Exception as e:
                 logger.error(f"Error in task processing: {e}", exc_info=True)
 
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
 
         # 4. Clean shutdown
         logger.info("Worker stop signaled. Shutting down background tasks and MT5...")
@@ -91,25 +89,17 @@ class PairWorker:
 
     def _get_task_nowait(self) -> Optional[TaskMessage]:
         try:
-            return self.task_queue.get(timeout=0.1)
-        except queue.Empty:
+            return self.task_queue.get_nowait()
+        except (queue.Empty, Exception):
             return None
 
     async def _process_task(self, task: TaskMessage):
         logger = logging.getLogger(__name__)
 
         if task.task_type == TaskType.IMAGE_TASK:
-            if self.pair_cfg.mode not in (PairMode.IMAGE, PairMode.BOTH):
-                logger.debug(f"Pair '{self.pair_cfg.name}' is configured for {self.pair_cfg.mode.value}, skipping image task.")
-                return
-
             await self._handle_image_task(task)
 
         elif task.task_type == TaskType.TEXT_TASK:
-            if self.pair_cfg.mode not in (PairMode.TEXT, PairMode.BOTH):
-                logger.debug(f"Pair '{self.pair_cfg.name}' is configured for {self.pair_cfg.mode.value}, skipping text task.")
-                return
-
             await self._handle_text_task(task)
 
     async def _handle_image_task(self, task: TaskMessage):
@@ -124,10 +114,12 @@ class PairWorker:
             return
 
         logger.info("Extracting chart information with Gemini Vision AI...")
-        analysis: GeminiChartAnalysis = self.gemini.analyze_chart(
-            image_input=task.image_path,
-            caption=task.caption
+        analysis: GeminiChartAnalysis = await asyncio.to_thread(
+            self.gemini.analyze_chart,
+            task.image_path,
+            task.caption
         )
+
 
         self._print_analysis_report(analysis)
 
@@ -216,7 +208,7 @@ class PairWorker:
         if task.reply_to_text:
             logger.info(f"Reply Context:\n{task.reply_to_text}")
 
-        signal = self.llm.parse_message(task.text or "", reply_to_text=task.reply_to_text)
+        signal = await asyncio.to_thread(self.llm.parse_message, task.text or "", task.reply_to_text)
         logger.info(
             f"Extracted Signal: Action={signal.action.value} | Symbol={signal.symbol} | "
             f"Entry={signal.entry_price} | SL={signal.stop_loss} | TP={signal.take_profit} | "
