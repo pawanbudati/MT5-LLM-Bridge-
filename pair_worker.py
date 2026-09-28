@@ -42,7 +42,8 @@ class PairWorker:
         logger = logging.getLogger(__name__)
 
         logger.info(Fore.CYAN + f"Starting Worker for Pair '{self.pair_cfg.name}' (Mode: {self.pair_cfg.mode.value.upper()})" + Style.RESET_ALL)
-        logger.info(f"  -> Channel: {self.pair_cfg.channel} | MT5 Path: {self.pair_cfg.mt5_path} | Magic: {self.pair_cfg.magic_number}")
+        login_display = f"Account {self.pair_cfg.mt5_login}" if self.pair_cfg.mt5_login else "Existing Session"
+        logger.info(f"  -> Channel: {self.pair_cfg.channel} | MT5 Path: {self.pair_cfg.mt5_path} | Magic: {self.pair_cfg.magic_number} | MT5 Login: {login_display}")
 
         # 1. Initialize MT5 Bridge
         self.bridge = MT5Bridge(pair_config=self.pair_cfg)

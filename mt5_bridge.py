@@ -44,9 +44,9 @@ class MT5Bridge:
         self.pair_config = pair_config
         self.terminal_path = pair_config.mt5_path if pair_config and pair_config.mt5_path else settings.MT5_PATH if hasattr(settings, "MT5_PATH") else ""
         self.magic_number = pair_config.magic_number if pair_config else 777999
-        self.login = pair_config.mt5_login if pair_config else None
-        self.password = pair_config.mt5_password if pair_config else None
-        self.server = pair_config.mt5_server if pair_config else None
+        self.login = pair_config.mt5_login if (pair_config and pair_config.mt5_login is not None) else getattr(settings, "MT5_LOGIN", None)
+        self.password = pair_config.mt5_password if (pair_config and pair_config.mt5_password is not None) else getattr(settings, "MT5_PASSWORD", None)
+        self.server = pair_config.mt5_server if (pair_config and pair_config.mt5_server is not None) else getattr(settings, "MT5_SERVER", None)
         self.dry_run = pair_config.dry_run if (pair_config and pair_config.dry_run is not None) else settings.DRY_RUN
         self.execution_mode = (pair_config.execution_mode if pair_config and pair_config.execution_mode else settings.EXECUTION_MODE).lower()
         self.deviation = settings.MT5_DEVIATION
@@ -56,23 +56,29 @@ class MT5Bridge:
         self._last_candle_offsets: Dict[str, float] = {}
 
     def connect(self) -> bool:
-        """Initialize connection to MetaTrader 5 terminal executable."""
-        logger.info(f"Connecting to MT5 terminal at: {self.terminal_path} (Magic: {self.magic_number})")
+        """Initialize connection to MetaTrader 5 terminal executable and handle account login."""
+        login_label = f"Account {self.login}" if self.login else "Existing Session"
+        logger.info(f"Connecting to MT5 terminal at: {self.terminal_path} (Magic: {self.magic_number}, Login: {login_label})")
 
         if not self.terminal_path or not os.path.exists(self.terminal_path):
             logger.error(f"MT5 terminal executable not found at specified path: '{self.terminal_path}'")
             self.connected = False
             return False
 
+        # 1. Connect/Initialize to the MT5 terminal instance
         init_args = {"path": self.terminal_path}
-        if self.login:
-            init_args["login"] = self.login
-        if self.password:
-            init_args["password"] = self.password
-        if self.server:
-            init_args["server"] = self.server
-
         res = mt5.initialize(**init_args)
+
+        # Fallback: If direct initialize failed and credentials are provided, attempt initialize with credentials
+        if not res and self.login:
+            fallback_args = dict(init_args)
+            fallback_args["login"] = int(self.login)
+            if self.password:
+                fallback_args["password"] = str(self.password)
+            if self.server:
+                fallback_args["server"] = str(self.server)
+            res = mt5.initialize(**fallback_args)
+
         if not res:
             err = mt5.last_error()
             logger.error(f"MT5 initialization failed for '{self.terminal_path}': {err}")
@@ -81,7 +87,6 @@ class MT5Bridge:
 
         self.connected = True
         terminal_info = mt5.terminal_info()
-        account_info = mt5.account_info()
         if terminal_info:
             logger.info(f"MT5 Connected! Terminal: {terminal_info.name} | Path: {terminal_info.path}")
             if not terminal_info.trade_allowed:
@@ -90,6 +95,41 @@ class MT5Bridge:
                     "Please click the 'Algo Trading' button in MT5 top toolbar to enable automated trades!"
                 )
 
+        # 2. Account Login Management
+        current_acc = mt5.account_info()
+        if self.login:
+            target_login = int(self.login)
+            is_already_logged_in = False
+            if current_acc and getattr(current_acc, "login", None) == target_login:
+                if not self.server or (getattr(current_acc, "server", "") or "").strip().lower() == self.server.strip().lower():
+                    is_already_logged_in = True
+
+            if is_already_logged_in:
+                logger.info(f"MT5 terminal is already logged into account {target_login} on server '{current_acc.server}'. Skipping login.")
+            else:
+                logger.info(f"Logging into MT5 account {target_login} (Server: {self.server or 'default'})...")
+                login_kwargs = {"login": target_login}
+                if self.password:
+                    login_kwargs["password"] = str(self.password)
+                if self.server:
+                    login_kwargs["server"] = str(self.server)
+
+                login_ok = mt5.login(**login_kwargs)
+                if not login_ok:
+                    err = mt5.last_error()
+                    logger.error(f"MT5 login failed for account {target_login} (Server: '{self.server}'): {err}")
+                    self.connected = False
+                    return False
+                logger.info(f"MT5 login successful for account {target_login} (Server: '{self.server or 'default'}').")
+                current_acc = mt5.account_info()
+        else:
+            if current_acc:
+                logger.info(f"No MT5 login credentials configured. Using existing active session: Account {current_acc.login} | Server {current_acc.server}")
+            else:
+                logger.warning("No MT5 login credentials configured and no active account session found in MT5 terminal.")
+
+        # 3. Log Account Summary & Lot Sizing
+        account_info = current_acc or mt5.account_info()
         if account_info:
             lot_gold = self.calculate_lot(instrument="GOLD")
             lot_btc = self.calculate_lot(instrument="BTCUSD")
@@ -201,11 +241,11 @@ class MT5Bridge:
     def classify_instrument(self, instrument: str = "", symbol: str = "", symbol_info=None) -> str:
         """Classify trading instrument into: GOLD, BTC, USOIL, US30, FOREX, or DEFAULT."""
         candidates = []
-        if instrument:
+        if instrument and isinstance(instrument, str):
             candidates.append(instrument.upper().strip())
-        if symbol:
+        if symbol and isinstance(symbol, str):
             candidates.append(symbol.upper().strip())
-        if symbol_info and hasattr(symbol_info, "name") and symbol_info.name:
+        if symbol_info and hasattr(symbol_info, "name") and isinstance(symbol_info.name, str):
             candidates.append(symbol_info.name.upper().strip())
 
         combined = " ".join(candidates)
@@ -337,9 +377,9 @@ class MT5Bridge:
         min_vol = settings.MIN_LOT_SIZE
         max_vol = 50.0
         if symbol_info:
-            step = symbol_info.volume_step or 0.01
-            min_vol = symbol_info.volume_min or settings.MIN_LOT_SIZE
-            max_vol = symbol_info.volume_max or 50.0
+            step = symbol_info.volume_step if isinstance(getattr(symbol_info, "volume_step", None), (int, float)) else 0.01
+            min_vol = symbol_info.volume_min if isinstance(getattr(symbol_info, "volume_min", None), (int, float)) else settings.MIN_LOT_SIZE
+            max_vol = symbol_info.volume_max if isinstance(getattr(symbol_info, "volume_max", None), (int, float)) else 50.0
 
         lot = round(round(lot / step) * step, 2)
         lot = max(min_vol, min(max_vol, lot))

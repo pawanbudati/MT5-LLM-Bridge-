@@ -54,6 +54,27 @@ def parse_price_offset(val: Any) -> Optional[Union[float, str]]:
         logger.warning(f"Invalid price offset value '{val}'. Ignoring.")
         return None
 
+def parse_login(val: Any) -> Optional[int]:
+    """Parse MT5 login/account number. Returns None if blank, None, <=0, or non-numeric."""
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val if val > 0 else None
+    str_val = str(val).strip()
+    if not str_val:
+        return None
+    if str_val.isdigit():
+        login_int = int(str_val)
+        return login_int if login_int > 0 else None
+    return None
+
+def parse_str_credential(val: Any) -> Optional[str]:
+    """Parse string credential (password/server). Returns None if blank, None, or whitespace."""
+    if val is None:
+        return None
+    str_val = str(val).strip()
+    return str_val if str_val else None
+
 class Settings:
     BASE_DIR: Path = BASE_DIR
     DOWNLOADS_DIR: Path = BASE_DIR / "downloads"
@@ -81,6 +102,11 @@ class Settings:
     DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
     FORCE_GOLD_ONLY: bool = os.getenv("FORCE_GOLD_ONLY", "false").lower() in ("true", "1", "yes")
     DEFAULT_GOLD_SYMBOL: str = os.getenv("DEFAULT_GOLD_SYMBOL", "GOLD.i#").strip()
+
+    # MT5 Global Login Credentials (Optional fallback: leave blank if already logged in)
+    MT5_LOGIN: Optional[int] = parse_login(os.getenv("MT5_LOGIN") or os.getenv("LOGIN"))
+    MT5_PASSWORD: Optional[str] = parse_str_credential(os.getenv("MT5_PASSWORD") or os.getenv("PASSWORD"))
+    MT5_SERVER: Optional[str] = parse_str_credential(os.getenv("MT5_SERVER") or os.getenv("SERVER"))
 
     # Ansh / Vision specific options
     EXECUTION_MODE: str = os.getenv("EXECUTION_MODE", "auto").lower()  # auto, breakout, market, pending
@@ -262,6 +288,39 @@ class Settings:
                                 if parsed_v is not None:
                                     p_offsets[ok.strip().upper()] = parsed_v
 
+                        login_val = None
+                        login_specified = False
+                        for lk in ("mt5_login", "login", "account", "mt5_account"):
+                            if lk in p:
+                                login_specified = True
+                                val = p[lk]
+                                if val is not None and str(val).strip():
+                                    login_val = val
+                                    break
+                        mt5_login = parse_login(login_val) if login_specified else self.MT5_LOGIN
+
+                        pass_val = None
+                        pass_specified = False
+                        for pk in ("mt5_password", "password", "pass", "mt5_pass"):
+                            if pk in p:
+                                pass_specified = True
+                                val = p[pk]
+                                if val is not None and str(val).strip():
+                                    pass_val = val
+                                    break
+                        mt5_password = parse_str_credential(pass_val) if pass_specified else self.MT5_PASSWORD
+
+                        server_val = None
+                        server_specified = False
+                        for sk in ("mt5_server", "server"):
+                            if sk in p:
+                                server_specified = True
+                                val = p[sk]
+                                if val is not None and str(val).strip():
+                                    server_val = val
+                                    break
+                        mt5_server = parse_str_credential(server_val) if server_specified else self.MT5_SERVER
+
                         pairs.append(
                             PairConfig(
                                 id=idx,
@@ -270,9 +329,9 @@ class Settings:
                                 mt5_path=str(p.get("mt5_path", "")).strip(),
                                 mode=mode,
                                 magic_number=int(p.get("magic", p.get("magic_number", 777000 + idx))),
-                                mt5_login=int(p["login"]) if p.get("login") else None,
-                                mt5_password=p.get("password"),
-                                mt5_server=p.get("server"),
+                                mt5_login=mt5_login,
+                                mt5_password=mt5_password,
+                                mt5_server=mt5_server,
                                 execution_mode=p.get("execution_mode"),
                                 dry_run=p.get("dry_run"),
                                 lot_gold=p.get("lot_gold"),
@@ -315,10 +374,38 @@ class Settings:
             magic_str = os.getenv(f"PAIR_{i}_MAGIC") or os.getenv(f"PAIR_{i}_MAGIC_NUMBER")
             magic = int(magic_str) if magic_str and magic_str.isdigit() else (777000 + i)
 
-            login_str = os.getenv(f"PAIR_{i}_LOGIN")
-            login = int(login_str) if login_str and login_str.isdigit() else None
-            password = os.getenv(f"PAIR_{i}_PASSWORD") or None
-            server = os.getenv(f"PAIR_{i}_SERVER") or None
+            login_key_found = False
+            login_raw = None
+            for lk in (f"PAIR_{i}_MT5_LOGIN", f"PAIR_{i}_LOGIN", f"PAIR_{i}_ACCOUNT", f"PAIR_{i}_MT5_ACCOUNT"):
+                if lk in os.environ:
+                    login_key_found = True
+                    val = os.environ[lk].strip()
+                    if val:
+                        login_raw = val
+                        break
+            login = parse_login(login_raw) if login_key_found else self.MT5_LOGIN
+
+            pass_key_found = False
+            pass_raw = None
+            for pk in (f"PAIR_{i}_MT5_PASSWORD", f"PAIR_{i}_PASSWORD", f"PAIR_{i}_PASS", f"PAIR_{i}_MT5_PASS"):
+                if pk in os.environ:
+                    pass_key_found = True
+                    val = os.environ[pk].strip()
+                    if val:
+                        pass_raw = val
+                        break
+            password = parse_str_credential(pass_raw) if pass_key_found else self.MT5_PASSWORD
+
+            server_key_found = False
+            server_raw = None
+            for sk in (f"PAIR_{i}_MT5_SERVER", f"PAIR_{i}_SERVER"):
+                if sk in os.environ:
+                    server_key_found = True
+                    val = os.environ[sk].strip()
+                    if val:
+                        server_raw = val
+                        break
+            server = parse_str_credential(server_raw) if server_key_found else self.MT5_SERVER
 
             exec_mode = os.getenv(f"PAIR_{i}_EXECUTION_MODE")
             dry_run_val = os.getenv(f"PAIR_{i}_DRY_RUN")
@@ -398,6 +485,9 @@ class Settings:
                         mt5_path=legacy_path,
                         mode=PairMode.TEXT if legacy_mode == "text" else PairMode.IMAGE,
                         magic_number=int(os.getenv("MT5_MAGIC_NUMBER", "777999")),
+                        mt5_login=self.MT5_LOGIN,
+                        mt5_password=self.MT5_PASSWORD,
+                        mt5_server=self.MT5_SERVER,
                         past_hours=legacy_past_hours,
                     )
                 )
