@@ -43,7 +43,10 @@ def parse_price_offset(val: Any) -> Optional[Union[float, str]]:
     str_val = str(val).strip()
     if not str_val:
         return None
-    if str_val.lower() == "auto":
+    lower_val = str_val.lower()
+    if lower_val in ("candle_match", "candle", "candles", "match", "candle-match", "candlematch"):
+        return "candle_match"
+    if lower_val == "auto":
         return "auto"
     try:
         return float(str_val)
@@ -150,6 +153,8 @@ class Settings:
         "0.0"
     )
     PRICE_OFFSETS: str = os.getenv("PRICE_OFFSETS", "{}")
+    CANDLE_MATCHING_ENABLED: bool = os.getenv("CANDLE_MATCHING_ENABLED", "true").lower() in ("true", "1", "yes")
+    CANDLE_MATCH_COUNT: int = int(os.getenv("CANDLE_MATCH_COUNT", "10"))
 
     def load_price_offsets(self) -> Dict[str, Union[float, str]]:
         """Parse PRICE_OFFSETS JSON string or dict into normalized dictionary."""
@@ -208,8 +213,12 @@ class Settings:
         if clean_broker in global_offsets:
             return global_offsets[clean_broker]
 
-        # 3. Check global USOIL_PRICE_OFFSET
+        # 3. Check global USOIL_PRICE_OFFSET or CANDLE_MATCHING_ENABLED
         if self.is_oil_instrument(clean_inst, clean_broker):
+            if self.USOIL_PRICE_OFFSET is not None and str(self.USOIL_PRICE_OFFSET).strip() not in ("0.0", "0"):
+                return self.USOIL_PRICE_OFFSET
+            if self.CANDLE_MATCHING_ENABLED:
+                return "candle_match"
             if self.USOIL_PRICE_OFFSET is not None:
                 return self.USOIL_PRICE_OFFSET
 

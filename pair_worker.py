@@ -135,7 +135,12 @@ class PairWorker:
         applied_offset = 0.0
         if hasattr(self.bridge, "apply_price_offset_to_analysis"):
             try:
-                res = self.bridge.apply_price_offset_to_analysis(analysis, broker_symbol=broker_sym)
+                res = self.bridge.apply_price_offset_to_analysis(
+                    analysis,
+                    broker_symbol=broker_sym,
+                    image_path=task.image_path,
+                    gemini_client=self.gemini
+                )
                 if isinstance(res, (tuple, list)) and len(res) == 2:
                     analysis, applied_offset = res
             except Exception as e:
@@ -163,7 +168,8 @@ class PairWorker:
                     lot=calc_lot,
                     summary=analysis.analysis_summary,
                     image_hash=image_hash,
-                    applied_price_offset=applied_offset
+                    applied_price_offset=applied_offset,
+                    offset_method=analysis.offset_method
                 )
                 self.breakout_monitor.add_setup(setup, analysis=analysis, caption=task.caption)
                 return
@@ -285,7 +291,11 @@ class PairWorker:
         if a.chart_current_price is not None:
             print(f"  Chart Live Px  : {a.chart_current_price}")
         if a.applied_price_offset is not None and a.applied_price_offset != 0.0:
-            print(Fore.CYAN + f"  Price Offset   : {a.applied_price_offset:+.4f} (MT5 Contract aligned)" + Style.RESET_ALL)
+            method_str = f" [{a.offset_method}]" if a.offset_method else ""
+            conf_str = f" (Confidence: {a.candle_match_confidence})" if a.candle_match_confidence else ""
+            print(Fore.CYAN + f"  Price Offset   : {a.applied_price_offset:+.4f}{method_str}{conf_str} (MT5 Contract aligned)" + Style.RESET_ALL)
+            if a.candle_match_details:
+                print(Fore.CYAN + f"  Match Details  : {a.candle_match_details}" + Style.RESET_ALL)
         print(f"  Timeframe      : {a.timeframe or 'N/A'}")
         print(f"  Action         : {Fore.GREEN if 'BUY' in a.action.value else Fore.RED}{a.action.value}{Style.RESET_ALL}")
         print(f"  Order Type     : {a.order_type.value if a.order_type else 'MARKET'}")

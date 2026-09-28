@@ -60,6 +60,9 @@ class GeminiChartAnalysis(BaseModel):
     trade_already_triggered: bool = Field(default=False, description="True if chart indicates the trade already broke out / was entered in the past")
     chart_current_price: Optional[float] = Field(default=None, description="Current market price shown on chart Y-axis scale")
     applied_price_offset: Optional[float] = Field(default=None, description="Price offset applied to calibrate chart levels with MT5 broker contract")
+    offset_method: Optional[str] = Field(default=None, description="Method used to calculate offset (e.g. candle_match, auto_tick, manual)")
+    candle_match_confidence: Optional[str] = Field(default=None, description="Confidence of candle matching: HIGH, MEDIUM, LOW")
+    candle_match_details: Optional[str] = Field(default=None, description="Details of the matched candles correlation")
 
 class TradeSignal(BaseModel):
     action: SignalAction = SignalAction.NONE
@@ -147,6 +150,7 @@ class BreakoutWatchSetup(BaseModel):
     summary: str = ""
     image_hash: Optional[str] = None
     applied_price_offset: Optional[float] = None
+    offset_method: Optional[str] = None
 
 class PairMode(str, Enum):
     IMAGE = "image"

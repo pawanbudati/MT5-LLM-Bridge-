@@ -243,6 +243,147 @@ class TestPriceOffset(unittest.TestCase):
         self.assertAlmostEqual(signal.stop_loss, 70.15)
         self.assertAlmostEqual(signal.take_profit, 72.35)
 
+    def test_map_timeframe_to_mt5(self):
+        from mt5_bridge import map_timeframe_to_mt5
+        import MetaTrader5 as mt5
+        self.assertEqual(map_timeframe_to_mt5("15m"), mt5.TIMEFRAME_M15)
+        self.assertEqual(map_timeframe_to_mt5("15M"), mt5.TIMEFRAME_M15)
+        self.assertEqual(map_timeframe_to_mt5("M15"), mt5.TIMEFRAME_M15)
+        self.assertEqual(map_timeframe_to_mt5("1h"), mt5.TIMEFRAME_H1)
+        self.assertEqual(map_timeframe_to_mt5("H1"), mt5.TIMEFRAME_H1)
+        self.assertEqual(map_timeframe_to_mt5("5m"), mt5.TIMEFRAME_M5)
+        self.assertEqual(map_timeframe_to_mt5("30m"), mt5.TIMEFRAME_M30)
+        self.assertEqual(map_timeframe_to_mt5("4h"), mt5.TIMEFRAME_H4)
+        self.assertEqual(map_timeframe_to_mt5(None), mt5.TIMEFRAME_M15)
+
+    @patch("mt5_bridge.mt5")
+    def test_get_recent_candles(self, mock_mt5):
+        bridge = MT5Bridge()
+        bridge.connected = True
+        bridge.ensure_connected = MagicMock(return_value=True)
+
+        dummy_rates = [
+            {"time": 1700000000, "open": 70.50, "high": 71.00, "low": 70.40, "close": 70.80},
+            {"time": 1700000900, "open": 70.80, "high": 71.20, "low": 70.70, "close": 70.75}
+        ]
+        mock_mt5.copy_rates_from_pos.return_value = dummy_rates
+
+        candles = bridge.get_recent_candles("OILCash#", timeframe_str="15m", count=2)
+        self.assertEqual(len(candles), 2)
+        self.assertEqual(candles[0]["open"], 70.50)
+        self.assertEqual(candles[0]["high"], 71.00)
+        self.assertTrue(candles[0]["is_bullish"])
+        self.assertFalse(candles[1]["is_bullish"])
+
+    @patch("mt5_bridge.mt5")
+    def test_candle_matching_calibration(self, mock_mt5):
+        pair_cfg = PairConfig(
+            id=1,
+            name="OilCandleMatch",
+            channel_id="123",
+            mt5_path="test",
+            usoil_price_offset="candle_match"
+        )
+        bridge = MT5Bridge(pair_config=pair_cfg)
+        bridge.connected = True
+        bridge.ensure_connected = MagicMock(return_value=True)
+        bridge.resolve_symbol = MagicMock(return_value="OILCash#")
+
+        # Mock MT5 candle rates
+        dummy_rates = [
+            {"time": 1700000000, "open": 71.20, "high": 71.55, "low": 71.10, "close": 71.45},
+            {"time": 1700000900, "open": 71.45, "high": 71.80, "low": 71.30, "close": 71.70}
+        ]
+        mock_mt5.copy_rates_from_pos.return_value = dummy_rates
+
+        # Mock Gemini client
+        mock_gemini = MagicMock()
+        mock_gemini.match_chart_candles_with_mt5.return_value = {
+            "matched": True,
+            "price_offset": 0.35,
+            "confidence": "HIGH",
+            "matched_details": "Matched candle sequence with +0.35 diff"
+        }
+
+        analysis = GeminiChartAnalysis(
+            instrument="USOILSPOT",
+            timeframe="15m",
+            upper_breakout_level=71.20,
+            upper_stop_loss=70.50,
+            upper_take_profit=72.80,
+            lower_breakout_level=70.00,
+            lower_stop_loss=70.70,
+            lower_take_profit=68.50,
+            chart_current_price=71.10
+        )
+
+        adjusted, applied = bridge.apply_price_offset_to_analysis(
+            analysis,
+            broker_symbol="OILCash#",
+            image_path="test_oil.jpg",
+            gemini_client=mock_gemini
+        )
+
+        self.assertEqual(applied, 0.35)
+        self.assertEqual(adjusted.applied_price_offset, 0.35)
+        self.assertEqual(adjusted.offset_method, "candle_match")
+        self.assertEqual(adjusted.candle_match_confidence, "HIGH")
+        self.assertAlmostEqual(adjusted.upper_breakout_level, 71.55)
+        self.assertAlmostEqual(adjusted.upper_stop_loss, 70.85)
+        self.assertAlmostEqual(adjusted.upper_take_profit, 73.15)
+        self.assertAlmostEqual(adjusted.lower_breakout_level, 70.35)
+        self.assertAlmostEqual(adjusted.lower_stop_loss, 71.05)
+        self.assertAlmostEqual(adjusted.lower_take_profit, 68.85)
+
+    @patch("mt5_bridge.mt5")
+    def test_candle_matching_fallback_to_auto_tick(self, mock_mt5):
+        pair_cfg = PairConfig(
+            id=1,
+            name="OilCandleMatchFallback",
+            channel_id="123",
+            mt5_path="test",
+            usoil_price_offset="candle_match"
+        )
+        bridge = MT5Bridge(pair_config=pair_cfg)
+        bridge.connected = True
+        bridge.ensure_connected = MagicMock(return_value=True)
+        bridge.resolve_symbol = MagicMock(return_value="OILCash#")
+
+        # Mock candles returned
+        mock_mt5.copy_rates_from_pos.return_value = [{"time": 1, "open": 70, "high": 71, "low": 69, "close": 70}]
+
+        # Gemini fails to match candles
+        mock_gemini = MagicMock()
+        mock_gemini.match_chart_candles_with_mt5.return_value = {
+            "matched": False,
+            "reason": "Image too blurry"
+        }
+
+        # Mock MT5 live tick: mid = (70.80 + 70.84) / 2 = 70.82
+        mock_tick = MagicMock()
+        mock_tick.bid = 70.80
+        mock_tick.ask = 70.84
+        mock_mt5.symbol_info_tick.return_value = mock_tick
+
+        analysis = GeminiChartAnalysis(
+            instrument="USOIL",
+            timeframe="15m",
+            upper_breakout_level=71.00,
+            chart_current_price=70.50
+        )
+
+        adjusted, applied = bridge.apply_price_offset_to_analysis(
+            analysis,
+            broker_symbol="OILCash#",
+            image_path="test_oil.jpg",
+            gemini_client=mock_gemini
+        )
+
+        # Expected fallback offset = 70.82 - 70.50 = +0.32
+        self.assertAlmostEqual(applied, 0.32, places=3)
+        self.assertEqual(adjusted.offset_method, "auto_tick")
+        self.assertAlmostEqual(adjusted.upper_breakout_level, 71.32, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

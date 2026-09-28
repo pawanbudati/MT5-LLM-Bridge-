@@ -4,7 +4,7 @@ import json
 import logging
 import mimetypes
 from pathlib import Path
-from typing import Optional, Union, Dict, Any
+from typing import Optional, Union, Dict, Any, List
 import requests
 
 from config import settings
@@ -304,3 +304,140 @@ class GeminiVisionClient:
                 action=SignalAction.NONE,
                 analysis_summary=f"Parsing error: {e}"
             )
+
+    def match_chart_candles_with_mt5(
+        self,
+        image_input: Union[str, Path, bytes],
+        mt5_candles: List[Dict[str, Any]],
+        timeframe: str = "15m",
+        instrument: str = "USOIL",
+        broker_symbol: str = "OILCash#",
+        mime_type: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Correlate the visual candle structure in the chart image with the MT5 broker's recent candles
+        for the same timeframe to calculate the exact price offset (MT5_Price - Chart_Price).
+        Formula: MT5_Broker_Price = Chart_Price + Offset
+        """
+        if not self.api_key:
+            logger.error("GEMINI_API_KEY is not set! Skipping candle matching.")
+            return {"matched": False, "price_offset": 0.0, "confidence": "NONE", "reason": "No API key"}
+
+        if not mt5_candles:
+            return {"matched": False, "price_offset": 0.0, "confidence": "NONE", "reason": "No MT5 candles provided"}
+
+        # 1. Prepare Base64 Image Data
+        if isinstance(image_input, (str, Path)):
+            path = Path(image_input)
+            if not path.exists():
+                logger.error(f"Image file not found: {path}")
+                return {"matched": False, "price_offset": 0.0, "confidence": "NONE", "reason": "File not found"}
+            if not mime_type:
+                mime_type = self._get_mime_type(path)
+            with open(path, "rb") as f:
+                image_bytes = f.read()
+        elif isinstance(image_input, bytes):
+            image_bytes = image_input
+            if not mime_type:
+                mime_type = "image/jpeg"
+        else:
+            raise ValueError(f"Unsupported image_input type: {type(image_input)}")
+
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+        # Format MT5 candles
+        candle_lines = []
+        for i, c in enumerate(mt5_candles, 1):
+            t_str = c.get("time_str", "")
+            direction = "BULLISH (GREEN)" if c.get("is_bullish") else "BEARISH (RED)"
+            o = c.get("open")
+            h = c.get("high")
+            l = c.get("low")
+            cl = c.get("close")
+            candle_lines.append(
+                f"  Candle #{i} ({t_str}): {direction} | Open: {o}, High: {h}, Low: {l}, Close: {cl} (Range: {c.get('range_size', '')})"
+            )
+        formatted_candles = "\n".join(candle_lines)
+
+        prompt_text = f"""
+You are an expert quantitative technical analyst and candle pattern correlation specialist.
+Your task is to correlate the price scale of this TradingView chart image ({instrument}, timeframe: {timeframe}) with the live MetaTrader 5 broker contract ({broker_symbol}).
+
+Due to broker contract specifications (e.g. USOILSPOT on TradingView vs OILCash on MT5), there is a price spread/offset between the chart's Y-axis price levels and MT5 broker prices. However, the candle structures (wicks, bodies, green/red sequences, swing peaks and swing troughs) are identical because they represent the same underlying crude oil market.
+
+Here are the latest {len(mt5_candles)} candles from the MT5 broker terminal ({broker_symbol}, timeframe: {timeframe}):
+{formatted_candles}
+
+INSTRUCTIONS:
+1. LOCATE AND MATCH THE CANDLES:
+   - Look at the rightmost sequence of completed and forming candles visible in the chart image.
+   - Match the visual pattern (bullish green vs bearish red candles, long wicks, dojis, engulfing bars, swing highs/lows) with the MT5 candle sequence listed above.
+2. EXTRACT CHART PRICES FOR MATCHED CANDLES:
+   - For 2 to 5 matched candles, read their exact or closest prices (High, Low, Close, or Open) using the chart's right-hand Y-axis scale and/or top-left OHLC display.
+3. COMPUTE THE PRICE OFFSET:
+   - Formula: Price Offset = MT5_Price - Chart_Price
+   - (So that: MT5_Broker_Price = Chart_Price + Offset)
+   - If MT5 price is higher than the chart price, Offset is POSITIVE (e.g. +0.35).
+   - If MT5 price is lower than the chart price, Offset is NEGATIVE (e.g. -0.25).
+4. RETURN STRICT JSON matching this schema:
+{{
+  "matched": true,
+  "price_offset": 0.35,
+  "confidence": "HIGH",
+  "chart_sample_price": 70.50,
+  "mt5_sample_price": 70.85,
+  "matched_candles_count": 3,
+  "matched_details": "Rightmost red candle on chart matches MT5 candle at 14:15. Chart High is 70.90, MT5 High is 71.25 -> diff +0.35.",
+  "reasoning": "Consistent +0.35 spread across matched candles."
+}}
+If unable to correlate candles (e.g. chart timeframe doesn't match or image too blurry), set "matched": false, "price_offset": 0.0, "confidence": "LOW".
+"""
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt_text},
+                        {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": b64_image
+                            }
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "response_mime_type": "application/json",
+                "temperature": 0.1
+            }
+        }
+
+        models_to_try = [self.model]
+        for fallback in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]:
+            if fallback not in models_to_try:
+                models_to_try.append(fallback)
+
+        for current_model in models_to_try:
+            url = f"{self.base_url}/{current_model}:generateContent?key={self.api_key}"
+            try:
+                response = requests.post(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=settings.GEMINI_TIMEOUT_SECONDS
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        content_parts = candidates[0].get("content", {}).get("parts", [])
+                        if content_parts:
+                            raw_text = content_parts[0].get("text", "")
+                            parsed = self._extract_json_block(raw_text)
+                            if parsed and isinstance(parsed, dict):
+                                return parsed
+            except Exception as e:
+                logger.warning(f"Error calling Gemini candle matching with model {current_model}: {e}")
+
+        return {"matched": False, "price_offset": 0.0, "confidence": "NONE", "reason": "Failed to call Gemini"}

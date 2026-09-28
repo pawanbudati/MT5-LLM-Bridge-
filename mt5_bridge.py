@@ -11,6 +11,34 @@ from models import TradeSignal, SignalAction, OrderTypeRecommended, ExecutionRes
 
 logger = logging.getLogger(__name__)
 
+def map_timeframe_to_mt5(tf_str: Optional[str]) -> int:
+    """Map timeframe string (e.g. '15m', '1h', 'H1', '5m') to MT5 TIMEFRAME_* constant."""
+    if not tf_str:
+        return mt5.TIMEFRAME_M15
+    clean = str(tf_str).strip().upper().replace(" ", "").replace("MIN", "M").replace("HOUR", "H").replace("HR", "H").replace("SEC", "S")
+    mapping = {
+        "M1": mt5.TIMEFRAME_M1, "1M": mt5.TIMEFRAME_M1,
+        "M2": mt5.TIMEFRAME_M2, "2M": mt5.TIMEFRAME_M2,
+        "M3": mt5.TIMEFRAME_M3, "3M": mt5.TIMEFRAME_M3,
+        "M4": mt5.TIMEFRAME_M4, "4M": mt5.TIMEFRAME_M4,
+        "M5": mt5.TIMEFRAME_M5, "5M": mt5.TIMEFRAME_M5,
+        "M6": mt5.TIMEFRAME_M6, "6M": mt5.TIMEFRAME_M6,
+        "M10": mt5.TIMEFRAME_M10, "10M": mt5.TIMEFRAME_M10,
+        "M12": mt5.TIMEFRAME_M12, "12M": mt5.TIMEFRAME_M12,
+        "M15": mt5.TIMEFRAME_M15, "15M": mt5.TIMEFRAME_M15,
+        "M20": mt5.TIMEFRAME_M20, "20M": mt5.TIMEFRAME_M20,
+        "M30": mt5.TIMEFRAME_M30, "30M": mt5.TIMEFRAME_M30,
+        "H1": mt5.TIMEFRAME_H1, "1H": mt5.TIMEFRAME_H1, "60M": mt5.TIMEFRAME_H1,
+        "H2": mt5.TIMEFRAME_H2, "2H": mt5.TIMEFRAME_H2,
+        "H3": mt5.TIMEFRAME_H3, "3H": mt5.TIMEFRAME_H3,
+        "H4": mt5.TIMEFRAME_H4, "4H": mt5.TIMEFRAME_H4, "240M": mt5.TIMEFRAME_H4,
+        "H6": mt5.TIMEFRAME_H6, "6H": mt5.TIMEFRAME_H6,
+        "H8": mt5.TIMEFRAME_H8, "8H": mt5.TIMEFRAME_H8,
+        "H12": mt5.TIMEFRAME_H12, "12H": mt5.TIMEFRAME_H12,
+        "D1": mt5.TIMEFRAME_D1, "1D": mt5.TIMEFRAME_D1, "DAILY": mt5.TIMEFRAME_D1,
+    }
+    return mapping.get(clean, mt5.TIMEFRAME_M15)
+
 class MT5Bridge:
     def __init__(self, pair_config: Optional[PairConfig] = None):
         self.pair_config = pair_config
@@ -25,6 +53,7 @@ class MT5Bridge:
         self.connected = False
         self._symbol_cache: Dict[str, str] = {}
         self.active_targets: Dict[int, dict] = {}
+        self._last_candle_offsets: Dict[str, float] = {}
 
     def connect(self) -> bool:
         """Initialize connection to MetaTrader 5 terminal executable."""
@@ -341,6 +370,151 @@ class MT5Bridge:
                     mt5.order_send(req)
                     logger.info(f"Cancelled old pending order #{o.ticket} on {symbol}")
 
+    def get_recent_candles(
+        self,
+        symbol: str,
+        timeframe_str: str = "15m",
+        count: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Fetch the most recent N candles for a symbol on the specified timeframe."""
+        if not self.ensure_connected():
+            return []
+
+        mt5_tf = map_timeframe_to_mt5(timeframe_str)
+        if self.connected:
+            mt5.symbol_select(symbol, True)
+
+        rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, count)
+        if rates is None or len(rates) == 0:
+            err = mt5.last_error() if hasattr(mt5, "last_error") else "Unknown"
+            logger.warning(f"Failed to fetch {timeframe_str} rates for {symbol}: {err}")
+            return []
+
+        candles = []
+        import datetime
+        for r in rates:
+            time_val = getattr(r, 'time', None) if not isinstance(r, (tuple, dict, list)) and hasattr(r, 'time') else r['time'] if isinstance(r, dict) or hasattr(r, '__getitem__') else 0
+            open_val = getattr(r, 'open', None) if not isinstance(r, (tuple, dict, list)) and hasattr(r, 'open') else r['open'] if isinstance(r, dict) or hasattr(r, '__getitem__') else 0.0
+            high_val = getattr(r, 'high', None) if not isinstance(r, (tuple, dict, list)) and hasattr(r, 'high') else r['high'] if isinstance(r, dict) or hasattr(r, '__getitem__') else 0.0
+            low_val = getattr(r, 'low', None) if not isinstance(r, (tuple, dict, list)) and hasattr(r, 'low') else r['low'] if isinstance(r, dict) or hasattr(r, '__getitem__') else 0.0
+            close_val = getattr(r, 'close', None) if not isinstance(r, (tuple, dict, list)) and hasattr(r, 'close') else r['close'] if isinstance(r, dict) or hasattr(r, '__getitem__') else 0.0
+
+            time_str = ""
+            try:
+                time_str = datetime.datetime.fromtimestamp(int(time_val)).strftime('%Y-%m-%d %H:%M')
+            except Exception:
+                pass
+
+            o = round(float(open_val), 3)
+            h = round(float(high_val), 3)
+            l = round(float(low_val), 3)
+            c = round(float(close_val), 3)
+            candles.append({
+                "time": int(time_val),
+                "time_str": time_str,
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c,
+                "is_bullish": bool(c >= o),
+                "body_size": round(abs(c - o), 3),
+                "range_size": round(h - l, 3),
+            })
+        return candles
+
+    def determine_candle_match_offset(
+        self,
+        analysis: GeminiChartAnalysis,
+        image_path: Optional[str] = None,
+        gemini_client: Optional[Any] = None,
+        broker_symbol: Optional[str] = None
+    ) -> Tuple[float, str, Optional[str]]:
+        """
+        Correlate chart candles with MT5 broker candles on the same timeframe to get the exact price offset.
+        Returns: (offset, method, details)
+        """
+        resolved_sym = broker_symbol or self.resolve_symbol(analysis.instrument)
+        if not resolved_sym:
+            return 0.0, "unresolved_symbol", None
+
+        # 1. Fetch recent MT5 candles on the chart's timeframe
+        tf = analysis.timeframe or "15m"
+        candles = self.get_recent_candles(resolved_sym, timeframe_str=tf, count=settings.CANDLE_MATCH_COUNT)
+
+        # 2. If candles and Gemini client available, run AI visual matching
+        if candles and gemini_client and image_path:
+            try:
+                logger.info(
+                    Fore.CYAN +
+                    f"[CANDLE MATCHING] Correlating {analysis.instrument} chart ({tf}) with {len(candles)} MT5 {resolved_sym} candles..." +
+                    Style.RESET_ALL
+                )
+                match_res = gemini_client.match_chart_candles_with_mt5(
+                    image_input=image_path,
+                    mt5_candles=candles,
+                    timeframe=tf,
+                    instrument=analysis.instrument or "USOIL",
+                    broker_symbol=resolved_sym
+                )
+                if match_res and match_res.get("matched"):
+                    offset = float(match_res.get("price_offset", 0.0))
+                    confidence = match_res.get("confidence", "HIGH")
+                    details = match_res.get("matched_details") or match_res.get("reasoning")
+                    analysis.offset_method = "candle_match"
+                    analysis.candle_match_confidence = confidence
+                    analysis.candle_match_details = details
+                    clean_inst = (analysis.instrument or "").strip().upper()
+                    clean_sym = (resolved_sym or "").strip().upper()
+                    if clean_inst:
+                        self._last_candle_offsets[clean_inst] = offset
+                    if clean_sym:
+                        self._last_candle_offsets[clean_sym] = offset
+                    logger.info(
+                        Fore.GREEN + Style.BRIGHT +
+                        f"[CANDLE MATCH SUCCESS] Offset = {offset:+.4f} (Confidence: {confidence}) | {details}" +
+                        Style.RESET_ALL
+                    )
+                    return offset, "candle_match", details
+                else:
+                    logger.warning(
+                        f"[CANDLE MATCH] Could not match candles: {match_res.get('reason', 'unmatched')}. Falling back to tick mid."
+                    )
+            except Exception as e:
+                logger.warning(f"Error during candle matching: {e}. Falling back to tick mid.")
+
+        # 3. Fallback to tick mid vs chart_current_price
+        if analysis.chart_current_price and analysis.chart_current_price > 0:
+            tick = mt5.symbol_info_tick(resolved_sym) if self.connected else None
+            if not tick and self.connected:
+                mt5.symbol_select(resolved_sym, True)
+                tick = mt5.symbol_info_tick(resolved_sym)
+            if tick and getattr(tick, "bid", 0.0) > 0 and getattr(tick, "ask", 0.0) > 0:
+                mt5_mid = (tick.bid + tick.ask) / 2.0
+                offset = round(mt5_mid - analysis.chart_current_price, 4)
+                analysis.offset_method = "auto_tick"
+                clean_inst = (analysis.instrument or "").strip().upper()
+                clean_sym = (resolved_sym or "").strip().upper()
+                if clean_inst:
+                    self._last_candle_offsets[clean_inst] = offset
+                if clean_sym:
+                    self._last_candle_offsets[clean_sym] = offset
+                logger.info(
+                    Fore.CYAN +
+                    f"[AUTO TICK FALLBACK] Offset = {offset:+.4f} (MT5 Mid: {mt5_mid:.4f} - Chart Px: {analysis.chart_current_price:.4f})" +
+                    Style.RESET_ALL
+                )
+                return offset, "auto_tick", f"Tick mid {mt5_mid:.4f} - Chart {analysis.chart_current_price:.4f}"
+
+        # 4. Fallback to cached offset if available
+        clean_inst = (analysis.instrument or "").strip().upper()
+        clean_sym = (resolved_sym or "").strip().upper()
+        cached = self._last_candle_offsets.get(clean_inst) or self._last_candle_offsets.get(clean_sym)
+        if cached is not None:
+            analysis.offset_method = "cached_candle_match"
+            return cached, "cached_candle_match", "Using recently matched candle offset"
+
+        return 0.0, "none", None
+
     def get_price_offset(
         self,
         instrument: str,
@@ -355,7 +529,8 @@ class MT5Bridge:
         1. Pair-level overrides (pair_config.usoil_price_offset / price_offsets).
         2. Global PRICE_OFFSETS dictionary.
         3. Global USOIL_PRICE_OFFSET for oil instruments.
-        4. "auto": Dynamically computes (MT5_mid_tick - chart_price).
+        4. "candle_match": Uses cached candle match offset if available, else falls back to tick mid.
+        5. "auto": Dynamically computes (MT5_mid_tick - chart_price).
         """
         raw_offset = settings.get_price_offset_for_instrument(
             instrument=instrument,
@@ -369,10 +544,19 @@ class MT5Bridge:
         if isinstance(raw_offset, (int, float)):
             return float(raw_offset)
 
-        if isinstance(raw_offset, str) and raw_offset.lower() == "auto":
+        clean_inst = (instrument or "").strip().upper()
+        clean_broker = (broker_symbol or "").strip().upper()
+
+        if isinstance(raw_offset, str) and raw_offset.lower() in ("candle_match", "auto"):
+            # Check cached candle-matched offset first
+            if clean_inst in self._last_candle_offsets:
+                return self._last_candle_offsets[clean_inst]
+            if clean_broker in self._last_candle_offsets:
+                return self._last_candle_offsets[clean_broker]
+
             if chart_price is None or chart_price <= 0:
                 logger.warning(
-                    f"Auto price offset requested for '{instrument}' but no valid chart_current_price available. "
+                    f"Auto/Candle price offset requested for '{instrument}' but no valid chart_current_price available. "
                     f"Using offset 0.0."
                 )
                 return 0.0
@@ -412,21 +596,50 @@ class MT5Bridge:
     def apply_price_offset_to_analysis(
         self,
         analysis: GeminiChartAnalysis,
-        broker_symbol: Optional[str] = None
+        broker_symbol: Optional[str] = None,
+        image_path: Optional[str] = None,
+        gemini_client: Optional[Any] = None
     ) -> Tuple[GeminiChartAnalysis, float]:
         """
         Apply price offset calibration to all price fields of a GeminiChartAnalysis.
         Ensures breakout levels, ranges, SL, and TP match the MT5 broker contract.
+        If candle matching is enabled, correlates chart candles with MT5 broker candles on the same timeframe.
         """
         if analysis.applied_price_offset is not None and analysis.applied_price_offset != 0.0:
             return analysis, analysis.applied_price_offset
 
         resolved_sym = broker_symbol or self.resolve_symbol(analysis.instrument)
-        offset = self.get_price_offset(
+        raw_offset = settings.get_price_offset_for_instrument(
             instrument=analysis.instrument,
-            broker_symbol=resolved_sym,
-            chart_price=analysis.chart_current_price
+            pair_cfg=self.pair_config,
+            broker_symbol=resolved_sym
         )
+
+        offset = 0.0
+        method = "manual"
+
+        # Check if candle matching should be executed
+        is_oil = settings.is_oil_instrument(analysis.instrument, resolved_sym)
+        should_candle_match = (
+            (raw_offset == "candle_match" or settings.CANDLE_MATCHING_ENABLED)
+            and is_oil
+        )
+
+        if should_candle_match and (image_path or self.connected):
+            offset, method, details = self.determine_candle_match_offset(
+                analysis=analysis,
+                image_path=image_path,
+                gemini_client=gemini_client,
+                broker_symbol=resolved_sym
+            )
+            analysis.offset_method = method
+        else:
+            offset = self.get_price_offset(
+                instrument=analysis.instrument,
+                broker_symbol=resolved_sym,
+                chart_price=analysis.chart_current_price
+            )
+            analysis.offset_method = "manual" if isinstance(raw_offset, (int, float)) else "auto_tick"
 
         if abs(offset) < 1e-6:
             analysis.applied_price_offset = 0.0
@@ -435,7 +648,7 @@ class MT5Bridge:
         digits = 2
         if resolved_sym and self.connected:
             s_info = mt5.symbol_info(resolved_sym)
-            if s_info and hasattr(s_info, "digits") and s_info.digits:
+            if s_info and hasattr(s_info, "digits") and isinstance(s_info.digits, int):
                 digits = s_info.digits
 
         def _shift(val: Optional[float]) -> Optional[float]:
@@ -463,7 +676,7 @@ class MT5Bridge:
         logger.info(
             Fore.CYAN + Style.BRIGHT +
             f"[PRICE OFFSET APPLIED] Shifted all chart levels for {analysis.instrument} "
-            f"({resolved_sym or 'contract'}) by offset: {offset:+.4f}" +
+            f"({resolved_sym or 'contract'}) by offset: {offset:+.4f} (Method: {analysis.offset_method or method})" +
             Style.RESET_ALL
         )
         return analysis, offset
@@ -494,7 +707,7 @@ class MT5Bridge:
         digits = 2
         if resolved_sym and self.connected:
             s_info = mt5.symbol_info(resolved_sym)
-            if s_info and hasattr(s_info, "digits") and s_info.digits:
+            if s_info and hasattr(s_info, "digits") and isinstance(s_info.digits, int):
                 digits = s_info.digits
 
         def _shift(val: Optional[float]) -> Optional[float]:

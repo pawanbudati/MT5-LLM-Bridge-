@@ -226,7 +226,8 @@ class BreakoutMonitor:
         print(f"  Timeframe      : {setup.timeframe or 'N/A'}")
         print(f"  Current Price  : {setup.initial_price:.4f}")
         if setup.applied_price_offset is not None and setup.applied_price_offset != 0.0:
-            print(f"  Price Offset   : {Fore.CYAN}{setup.applied_price_offset:+.4f} (MT5 Contract aligned){Style.RESET_ALL}")
+            method_info = f" [{setup.offset_method}]" if setup.offset_method else ""
+            print(f"  Price Offset   : {Fore.CYAN}{setup.applied_price_offset:+.4f}{method_info} (MT5 Contract aligned){Style.RESET_ALL}")
         
         if setup.upper_breakout_level:
             dist_up = setup.upper_breakout_level - setup.initial_price
