@@ -58,6 +58,8 @@ class GeminiChartAnalysis(BaseModel):
     analysis_summary: str = Field(default="", description="Concise description of trade setup")
     is_profit_recap: bool = Field(default=False, description="True if image is a celebration/profit/recap of an already executed or completed trade")
     trade_already_triggered: bool = Field(default=False, description="True if chart indicates the trade already broke out / was entered in the past")
+    chart_current_price: Optional[float] = Field(default=None, description="Current market price shown on chart Y-axis scale")
+    applied_price_offset: Optional[float] = Field(default=None, description="Price offset applied to calibrate chart levels with MT5 broker contract")
 
 class TradeSignal(BaseModel):
     action: SignalAction = SignalAction.NONE
@@ -79,6 +81,7 @@ class TradeSignal(BaseModel):
     raw_summary: Optional[str] = None
     notes: Optional[str] = None
     parser_used: str = "gemini"
+    applied_price_offset: Optional[float] = Field(default=None, description="Price offset applied to calibrate levels with MT5 broker contract")
 
     # Convenient accessors for compatibility between Ansh and TWM conventions
     @property
@@ -143,6 +146,7 @@ class BreakoutWatchSetup(BaseModel):
     status: str = "WATCHING"  # WATCHING, TRIGGERED_BUY, TRIGGERED_SELL, EXPIRED, CANCELLED, SUPERSEDED
     summary: str = ""
     image_hash: Optional[str] = None
+    applied_price_offset: Optional[float] = None
 
 class PairMode(str, Enum):
     IMAGE = "image"
@@ -169,6 +173,9 @@ class PairConfig(BaseModel):
     lot_forex: Optional[float] = None
     lot_default: Optional[float] = None
     past_hours: float = 0.0
+    # Optional per-pair price offset overrides (e.g. USOILSPOT chart vs OILCash on MT5)
+    usoil_price_offset: Optional[Union[float, str]] = None
+    price_offsets: Dict[str, Union[float, str]] = Field(default_factory=dict)
 
 class TaskType(str, Enum):
     IMAGE_TASK = "image"

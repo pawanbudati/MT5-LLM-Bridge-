@@ -2,12 +2,12 @@ import os
 import math
 import asyncio
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple, Union
 import MetaTrader5 as mt5
 from colorama import Fore, Style
 
 from config import settings
-from models import TradeSignal, SignalAction, OrderTypeRecommended, ExecutionResult, PairConfig
+from models import TradeSignal, SignalAction, OrderTypeRecommended, ExecutionResult, PairConfig, GeminiChartAnalysis
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +341,185 @@ class MT5Bridge:
                     mt5.order_send(req)
                     logger.info(f"Cancelled old pending order #{o.ticket} on {symbol}")
 
+    def get_price_offset(
+        self,
+        instrument: str,
+        broker_symbol: Optional[str] = None,
+        chart_price: Optional[float] = None
+    ) -> float:
+        """
+        Determine the price offset to add to chart prices so they match the MT5 broker contract.
+        Formula: MT5_Broker_Price = Chart_Price + Offset
+
+        Offset sources:
+        1. Pair-level overrides (pair_config.usoil_price_offset / price_offsets).
+        2. Global PRICE_OFFSETS dictionary.
+        3. Global USOIL_PRICE_OFFSET for oil instruments.
+        4. "auto": Dynamically computes (MT5_mid_tick - chart_price).
+        """
+        raw_offset = settings.get_price_offset_for_instrument(
+            instrument=instrument,
+            pair_cfg=self.pair_config,
+            broker_symbol=broker_symbol
+        )
+
+        if raw_offset is None:
+            return 0.0
+
+        if isinstance(raw_offset, (int, float)):
+            return float(raw_offset)
+
+        if isinstance(raw_offset, str) and raw_offset.lower() == "auto":
+            if chart_price is None or chart_price <= 0:
+                logger.warning(
+                    f"Auto price offset requested for '{instrument}' but no valid chart_current_price available. "
+                    f"Using offset 0.0."
+                )
+                return 0.0
+
+            target_symbol = broker_symbol or self.resolve_symbol(instrument)
+            if not target_symbol:
+                logger.warning(f"Auto price offset requested but could not resolve symbol for '{instrument}'. Using 0.0.")
+                return 0.0
+
+            tick = mt5.symbol_info_tick(target_symbol) if self.connected else None
+            if not tick and self.connected:
+                mt5.symbol_select(target_symbol, True)
+                tick = mt5.symbol_info_tick(target_symbol)
+
+            if tick and getattr(tick, "bid", 0.0) > 0 and getattr(tick, "ask", 0.0) > 0:
+                mt5_mid = (tick.bid + tick.ask) / 2.0
+                calc_offset = round(mt5_mid - chart_price, 4)
+                logger.info(
+                    Fore.CYAN + Style.BRIGHT +
+                    f"[AUTO PRICE OFFSET] Calibrated {instrument} ({target_symbol}): "
+                    f"MT5 Mid ({mt5_mid:.4f}) - Chart Price ({chart_price:.4f}) = Offset {calc_offset:+.4f}" +
+                    Style.RESET_ALL
+                )
+                return calc_offset
+            else:
+                logger.warning(
+                    f"Auto price offset requested for '{instrument}' ({target_symbol}) but MT5 market tick unavailable. "
+                    f"Using offset 0.0."
+                )
+                return 0.0
+
+        try:
+            return float(raw_offset)
+        except (ValueError, TypeError):
+            return 0.0
+
+    def apply_price_offset_to_analysis(
+        self,
+        analysis: GeminiChartAnalysis,
+        broker_symbol: Optional[str] = None
+    ) -> Tuple[GeminiChartAnalysis, float]:
+        """
+        Apply price offset calibration to all price fields of a GeminiChartAnalysis.
+        Ensures breakout levels, ranges, SL, and TP match the MT5 broker contract.
+        """
+        if analysis.applied_price_offset is not None and analysis.applied_price_offset != 0.0:
+            return analysis, analysis.applied_price_offset
+
+        resolved_sym = broker_symbol or self.resolve_symbol(analysis.instrument)
+        offset = self.get_price_offset(
+            instrument=analysis.instrument,
+            broker_symbol=resolved_sym,
+            chart_price=analysis.chart_current_price
+        )
+
+        if abs(offset) < 1e-6:
+            analysis.applied_price_offset = 0.0
+            return analysis, 0.0
+
+        digits = 2
+        if resolved_sym and self.connected:
+            s_info = mt5.symbol_info(resolved_sym)
+            if s_info and hasattr(s_info, "digits") and s_info.digits:
+                digits = s_info.digits
+
+        def _shift(val: Optional[float]) -> Optional[float]:
+            if val is None:
+                return None
+            return round(val + offset, digits)
+
+        analysis.upper_breakout_level = _shift(analysis.upper_breakout_level)
+        analysis.lower_breakout_level = _shift(analysis.lower_breakout_level)
+        analysis.upper_stop_loss = _shift(analysis.upper_stop_loss)
+        analysis.upper_take_profit = _shift(analysis.upper_take_profit)
+        analysis.lower_stop_loss = _shift(analysis.lower_stop_loss)
+        analysis.lower_take_profit = _shift(analysis.lower_take_profit)
+        analysis.range_high = _shift(analysis.range_high)
+        analysis.range_low = _shift(analysis.range_low)
+        analysis.entry_price = _shift(analysis.entry_price)
+        analysis.entry_zone_min = _shift(analysis.entry_zone_min)
+        analysis.entry_zone_max = _shift(analysis.entry_zone_max)
+        analysis.stop_loss = _shift(analysis.stop_loss)
+        analysis.take_profit_1 = _shift(analysis.take_profit_1)
+        analysis.take_profit_2 = _shift(analysis.take_profit_2)
+        analysis.take_profit_3 = _shift(analysis.take_profit_3)
+        analysis.applied_price_offset = offset
+
+        logger.info(
+            Fore.CYAN + Style.BRIGHT +
+            f"[PRICE OFFSET APPLIED] Shifted all chart levels for {analysis.instrument} "
+            f"({resolved_sym or 'contract'}) by offset: {offset:+.4f}" +
+            Style.RESET_ALL
+        )
+        return analysis, offset
+
+    def apply_price_offset_to_signal(
+        self,
+        signal: TradeSignal,
+        broker_symbol: Optional[str] = None
+    ) -> Tuple[TradeSignal, float]:
+        """
+        Apply price offset calibration to a TradeSignal.
+        """
+        if signal.applied_price_offset is not None and signal.applied_price_offset != 0.0:
+            return signal, signal.applied_price_offset
+
+        sym = signal.symbol or ""
+        resolved_sym = broker_symbol or self.resolve_symbol(sym)
+        offset = self.get_price_offset(
+            instrument=sym,
+            broker_symbol=resolved_sym,
+            chart_price=signal.entry_price
+        )
+
+        if abs(offset) < 1e-6:
+            signal.applied_price_offset = 0.0
+            return signal, 0.0
+
+        digits = 2
+        if resolved_sym and self.connected:
+            s_info = mt5.symbol_info(resolved_sym)
+            if s_info and hasattr(s_info, "digits") and s_info.digits:
+                digits = s_info.digits
+
+        def _shift(val: Optional[float]) -> Optional[float]:
+            if val is None:
+                return None
+            return round(val + offset, digits)
+
+        signal.entry_price = _shift(signal.entry_price)
+        signal.stop_loss = _shift(signal.stop_loss)
+        signal.take_profit = _shift(signal.take_profit)
+        signal.target_1 = _shift(signal.target_1)
+        signal.target_2 = _shift(signal.target_2)
+        signal.target_3 = _shift(signal.target_3)
+        if signal.take_profit_levels:
+            signal.take_profit_levels = [_shift(tp) for tp in signal.take_profit_levels if tp is not None]
+        signal.applied_price_offset = offset
+
+        logger.info(
+            Fore.CYAN + Style.BRIGHT +
+            f"[PRICE OFFSET APPLIED] Shifted signal levels for {sym} "
+            f"({resolved_sym or 'contract'}) by offset: {offset:+.4f}" +
+            Style.RESET_ALL
+        )
+        return signal, offset
+
     def execute_signal(self, signal: TradeSignal) -> ExecutionResult:
         """Execute a parsed trading signal (either Vision or Text)."""
         if not self.ensure_connected():
@@ -364,6 +543,10 @@ class MT5Bridge:
                 symbol=sym_input,
                 comment=f"Broker symbol could not be resolved for '{sym_input}'"
             )
+
+        # Calibrate signal price levels with MT5 broker offset if not already applied
+        if signal.applied_price_offset is None:
+            signal, _ = self.apply_price_offset_to_signal(signal, broker_symbol=broker_symbol)
 
         symbol_info = mt5.symbol_info(broker_symbol)
         if not symbol_info:

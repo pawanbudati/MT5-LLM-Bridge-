@@ -62,6 +62,10 @@ Examine the following elements thoroughly:
    - If the chart shows a trade that has ALREADY broken out or already reached targets/completed, set `is_profit_recap: true` and `trade_already_triggered: true`.
    - If the chart is an upcoming / fresh trade waiting for breakout, set both to false.
 
+8. CURRENT LIVE CHART PRICE:
+   - Check the right-hand Y-axis price scale for the highlighted active market price badge or the current candle close price.
+   - Extract this value as `chart_current_price` (float or null).
+
 Output MUST be strictly valid JSON matching this schema:
 {
   "is_valid_signal": true,
@@ -69,6 +73,7 @@ Output MUST be strictly valid JSON matching this schema:
   "timeframe": "15m",
   "action": "BUY_LIMIT",
   "order_type": "LIMIT",
+  "chart_current_price": 95.12,
   "entry_price": 94.85,
   "entry_zone_min": 94.50,
   "entry_zone_max": 94.85,
@@ -268,6 +273,7 @@ class GeminiVisionClient:
                 timeframe=parsed_json.get("timeframe"),
                 action=action_enum,
                 order_type=order_type_enum,
+                chart_current_price=parsed_json.get("chart_current_price"),
                 entry_price=parsed_json.get("entry_price"),
                 entry_zone_min=parsed_json.get("entry_zone_min"),
                 entry_zone_max=parsed_json.get("entry_zone_max"),

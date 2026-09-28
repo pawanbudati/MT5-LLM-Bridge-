@@ -225,6 +225,8 @@ class BreakoutMonitor:
         print(f"  Allocated Lot  : {Fore.GREEN}{setup.lot} lots{Style.RESET_ALL} (per $50 account rules)")
         print(f"  Timeframe      : {setup.timeframe or 'N/A'}")
         print(f"  Current Price  : {setup.initial_price:.4f}")
+        if setup.applied_price_offset is not None and setup.applied_price_offset != 0.0:
+            print(f"  Price Offset   : {Fore.CYAN}{setup.applied_price_offset:+.4f} (MT5 Contract aligned){Style.RESET_ALL}")
         
         if setup.upper_breakout_level:
             dist_up = setup.upper_breakout_level - setup.initial_price

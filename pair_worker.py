@@ -130,13 +130,23 @@ class PairWorker:
             task.caption
         )
 
+        # Apply price offset calibration (e.g. USOILSPOT chart vs OILCash on MT5)
+        broker_sym = self.bridge.resolve_symbol(analysis.instrument) if analysis.instrument else None
+        applied_offset = 0.0
+        if hasattr(self.bridge, "apply_price_offset_to_analysis"):
+            try:
+                res = self.bridge.apply_price_offset_to_analysis(analysis, broker_symbol=broker_sym)
+                if isinstance(res, (tuple, list)) and len(res) == 2:
+                    analysis, applied_offset = res
+            except Exception as e:
+                logger.warning(f"Error applying price offset to analysis: {e}")
+
         self._print_analysis_report(analysis)
 
         has_breakout_levels = bool(analysis.upper_breakout_level or analysis.lower_breakout_level)
         exec_mode = (self.pair_cfg.execution_mode or settings.EXECUTION_MODE).lower()
 
         if self.breakout_monitor and settings.BREAKOUT_MONITOR_ENABLED and has_breakout_levels and exec_mode != "market":
-            broker_sym = self.bridge.resolve_symbol(analysis.instrument)
             if broker_sym:
                 calc_lot = self.bridge.calculate_lot(symbol=broker_sym, instrument=analysis.instrument)
                 setup = BreakoutWatchSetup(
@@ -152,7 +162,8 @@ class PairWorker:
                     lower_take_profit=analysis.lower_take_profit,
                     lot=calc_lot,
                     summary=analysis.analysis_summary,
-                    image_hash=image_hash
+                    image_hash=image_hash,
+                    applied_price_offset=applied_offset
                 )
                 self.breakout_monitor.add_setup(setup, analysis=analysis, caption=task.caption)
                 return
@@ -204,7 +215,8 @@ class PairWorker:
                 order_type=analysis.order_type,
                 arrow_note=arrow_text,
                 timeframe=analysis.timeframe,
-                raw_summary=analysis.analysis_summary
+                raw_summary=analysis.analysis_summary,
+                applied_price_offset=applied_offset
             )
 
             logger.info(Fore.CYAN + f"Sending signal to MT5: {signal.action.value} {signal.symbol}..." + Style.RESET_ALL)
@@ -241,16 +253,23 @@ class PairWorker:
             return
 
         for signal in valid_signals:
+            broker_sym = self.bridge.resolve_symbol(signal.symbol) if signal.symbol else None
+            if hasattr(self.bridge, "apply_price_offset_to_signal"):
+                try:
+                    res = self.bridge.apply_price_offset_to_signal(signal, broker_symbol=broker_sym)
+                    if isinstance(res, (tuple, list)) and len(res) == 2:
+                        signal, _ = res
+                except Exception as e:
+                    logger.warning(f"Error applying price offset to signal: {e}")
+
             logger.info(
                 f"Processing Signal: Action={signal.action.value} | Symbol={signal.symbol} | "
                 f"Entry={signal.entry_price} | SL={signal.stop_loss} | TP={signal.take_profit} | "
                 f"T1={signal.target_1} | T2={signal.target_2} | Parser={signal.parser_used}"
             )
 
-            if signal.symbol:
-                broker_sym = self.bridge.resolve_symbol(signal.symbol)
-                if broker_sym and self.breakout_monitor:
-                    self.breakout_monitor.cancel_setup_for_symbol(broker_sym, instrument=signal.symbol, reason="SUPERSEDED_BY_TEXT_SIGNAL")
+            if signal.symbol and broker_sym and self.breakout_monitor:
+                self.breakout_monitor.cancel_setup_for_symbol(broker_sym, instrument=signal.symbol, reason="SUPERSEDED_BY_TEXT_SIGNAL")
 
             result = self.bridge.execute_signal(signal)
             if result.success:
@@ -263,6 +282,10 @@ class PairWorker:
         print(Fore.MAGENTA + Style.BRIGHT + f"\n--- GEMINI VISION ANALYSIS REPORT ({self.pair_cfg.name}) ---" + Style.RESET_ALL)
         print(f"  Valid Signal   : {'YES' if a.is_valid_signal else 'NO'}")
         print(f"  Instrument     : {a.instrument or 'N/A'}")
+        if a.chart_current_price is not None:
+            print(f"  Chart Live Px  : {a.chart_current_price}")
+        if a.applied_price_offset is not None and a.applied_price_offset != 0.0:
+            print(Fore.CYAN + f"  Price Offset   : {a.applied_price_offset:+.4f} (MT5 Contract aligned)" + Style.RESET_ALL)
         print(f"  Timeframe      : {a.timeframe or 'N/A'}")
         print(f"  Action         : {Fore.GREEN if 'BUY' in a.action.value else Fore.RED}{a.action.value}{Style.RESET_ALL}")
         print(f"  Order Type     : {a.order_type.value if a.order_type else 'MARKET'}")

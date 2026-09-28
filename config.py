@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from dotenv import load_dotenv
 
 from models import PairConfig, PairMode
@@ -33,6 +33,23 @@ def parse_past_hours(val: Any) -> float:
     except (ValueError, TypeError):
         logger.warning(f"Invalid past_hours value '{val}'. Defaulting to 0.0 (disabled).")
         return 0.0
+
+def parse_price_offset(val: Any) -> Optional[Union[float, str]]:
+    """Parse price offset value. Can be a float (e.g. 0.25, -0.30) or 'auto', or None if blank/invalid."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    str_val = str(val).strip()
+    if not str_val:
+        return None
+    if str_val.lower() == "auto":
+        return "auto"
+    try:
+        return float(str_val)
+    except (ValueError, TypeError):
+        logger.warning(f"Invalid price offset value '{val}'. Ignoring.")
+        return None
 
 class Settings:
     BASE_DIR: Path = BASE_DIR
@@ -122,6 +139,83 @@ class Settings:
             return {}
 
     # =========================================================================
+    # Price Offsets (e.g. USOILSPOT on chart vs OILCash on MT5)
+    # =========================================================================
+    USOIL_PRICE_OFFSET: Optional[Union[float, str]] = parse_price_offset(
+        os.getenv("USOIL_PRICE_OFFSET") or 
+        os.getenv("OFFSET_USOIL") or 
+        os.getenv("USOIL_OFFSET") or 
+        os.getenv("PRICE_OFFSET_USOIL") or 
+        os.getenv("OILCASH_PRICE_OFFSET") or 
+        "0.0"
+    )
+    PRICE_OFFSETS: str = os.getenv("PRICE_OFFSETS", "{}")
+
+    def load_price_offsets(self) -> Dict[str, Union[float, str]]:
+        """Parse PRICE_OFFSETS JSON string or dict into normalized dictionary."""
+        try:
+            if isinstance(self.PRICE_OFFSETS, dict):
+                raw = self.PRICE_OFFSETS
+            else:
+                raw = json.loads(self.PRICE_OFFSETS) if self.PRICE_OFFSETS else {}
+            res = {}
+            for k, v in raw.items():
+                parsed = parse_price_offset(v)
+                if parsed is not None:
+                    res[k.strip().upper()] = parsed
+            return res
+        except Exception as e:
+            logger.warning(f"Failed to parse PRICE_OFFSETS JSON: {e}. Using empty dict.")
+            return {}
+
+    def is_oil_instrument(self, instrument: str = "", broker_symbol: str = "") -> bool:
+        """Check if instrument or broker_symbol is US Oil / WTI / Crude / OILCash."""
+        oil_markers = {"USOIL", "USOILSPOT", "USOILCASH", "OILCASH", "OIL", "WTI", "WTICRUDE", "CRUDE", "CRUDESOIL", "CL", "XTIUSD"}
+        cand = f"{instrument} {broker_symbol}".upper()
+        clean = cand.replace("#", "").replace(".", " ").replace("_", " ").replace("/", " ").replace("-", " ")
+        words = set(clean.split())
+        return any(m in words for m in oil_markers)
+
+    def get_price_offset_for_instrument(
+        self,
+        instrument: str,
+        pair_cfg: Optional[PairConfig] = None,
+        broker_symbol: Optional[str] = None
+    ) -> Optional[Union[float, str]]:
+        """
+        Get configured price offset for a specific instrument.
+        Checks:
+        1. Pair-specific overrides (pair_cfg.usoil_price_offset, pair_cfg.price_offsets).
+        2. Global PRICE_OFFSETS dict.
+        3. Global USOIL_PRICE_OFFSET for oil instruments.
+        """
+        clean_inst = (instrument or "").strip().upper()
+        clean_broker = (broker_symbol or "").strip().upper()
+
+        # 1. Check pair_config if provided
+        if pair_cfg:
+            if clean_inst in pair_cfg.price_offsets:
+                return pair_cfg.price_offsets[clean_inst]
+            if clean_broker in pair_cfg.price_offsets:
+                return pair_cfg.price_offsets[clean_broker]
+            if pair_cfg.usoil_price_offset is not None and self.is_oil_instrument(clean_inst, clean_broker):
+                return pair_cfg.usoil_price_offset
+
+        # 2. Check global PRICE_OFFSETS dict
+        global_offsets = self.load_price_offsets()
+        if clean_inst in global_offsets:
+            return global_offsets[clean_inst]
+        if clean_broker in global_offsets:
+            return global_offsets[clean_broker]
+
+        # 3. Check global USOIL_PRICE_OFFSET
+        if self.is_oil_instrument(clean_inst, clean_broker):
+            if self.USOIL_PRICE_OFFSET is not None:
+                return self.USOIL_PRICE_OFFSET
+
+        return 0.0
+
+    # =========================================================================
     # Telegram Channel <-> MT5 Terminal Pairs Discovery
     # =========================================================================
     def get_configured_pairs(self) -> List[PairConfig]:
@@ -151,6 +245,14 @@ class Settings:
                         past_hours_raw = p.get("past_hours", p.get("fetch_past_hours", p.get("read_past_hours")))
                         past_hours = parse_past_hours(past_hours_raw)
 
+                        usoil_offset = parse_price_offset(p.get("usoil_price_offset", p.get("usoil_offset", p.get("price_offset"))))
+                        p_offsets = {}
+                        if isinstance(p.get("price_offsets"), dict):
+                            for ok, ov in p["price_offsets"].items():
+                                parsed_v = parse_price_offset(ov)
+                                if parsed_v is not None:
+                                    p_offsets[ok.strip().upper()] = parsed_v
+
                         pairs.append(
                             PairConfig(
                                 id=idx,
@@ -171,6 +273,8 @@ class Settings:
                                 lot_forex=p.get("lot_forex"),
                                 lot_default=p.get("lot_default"),
                                 past_hours=past_hours,
+                                usoil_price_offset=usoil_offset,
+                                price_offsets=p_offsets,
                             )
                         )
                     if pairs:
@@ -232,6 +336,14 @@ class Settings:
                         break
             past_hours = parse_past_hours(past_hours_raw)
 
+            # Optional pair price offset
+            usoil_offset_raw = None
+            for ok in (f"PAIR_{i}_USOIL_PRICE_OFFSET", f"PAIR_{i}_USOIL_OFFSET", f"PAIR_{i}_PRICE_OFFSET", f"PAIR_{i}_OFFSET_USOIL"):
+                if ok in os.environ:
+                    usoil_offset_raw = os.environ[ok]
+                    break
+            usoil_offset = parse_price_offset(usoil_offset_raw)
+
             pairs.append(
                 PairConfig(
                     id=i,
@@ -252,6 +364,7 @@ class Settings:
                     lot_forex=lot_forex,
                     lot_default=lot_default,
                     past_hours=past_hours,
+                    usoil_price_offset=usoil_offset,
                 )
             )
 
